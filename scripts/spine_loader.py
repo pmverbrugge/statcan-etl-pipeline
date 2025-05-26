@@ -10,6 +10,7 @@ and prepares it for loading into structured warehouse tables.
 
 import os
 import json
+import tempfile
 import requests
 import duckdb
 from loguru import logger
@@ -22,10 +23,7 @@ import psycopg2
 # ------------------ #
 
 WDS_ENDPOINT = "https://www150.statcan.gc.ca/t1/wds/rest/getAllCubesList"
-DUCKDB_PATH = "../data/statcan.duckdb"
-
-con = duckdb.connect(DUCKDB_PATH)
-
+con = duckdb.connect(":memory:")
 
 # ------------------ #
 #  Helper Functions  #
@@ -46,10 +44,15 @@ def stage_base_data(json_bytes: bytes):
     """Load raw JSON into DuckDB and define views."""
     con.sql("INSTALL json; LOAD json;")
 
-    con.sql("""
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".json", delete=False) as f:
+        f.write(json_bytes.decode("utf-8"))
+        f.flush()
+        json_path = f.name
+
+    con.execute(f"""
     CREATE OR REPLACE VIEW base_cube AS 
-    SELECT * FROM read_json(?)
-    """, [json_bytes.decode("utf-8")])
+    SELECT * FROM read_json_auto('{json_path}')
+    """)
 
     con.sql("""
     CREATE OR REPLACE VIEW cube AS 
@@ -102,7 +105,6 @@ def stage_base_data(json_bytes: bytes):
     """)
 
     logger.info("Created staging views in DuckDB.")
-
 
 # ------------------ #
 #  Main Pipeline     #
