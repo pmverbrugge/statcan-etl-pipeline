@@ -97,15 +97,17 @@ def main():
 
             file_url = result["object"]
             file_resp = requests.get(file_url)
-            file_resp.raise_for_status()
             file_bytes = file_resp.content
 
+            # Skip if file is too large
             if len(file_bytes) >= MAX_BYTES:
                 with conn.cursor() as cur:
                     log_result(cur, productid, "skipped", notes=f"File too large: {len(file_bytes)} bytes")
                 logger.warning(f"🚫 Skipping {productid}.sdmx.zip: file too large ({len(file_bytes)} bytes)")
                 conn.commit()
                 continue
+            
+            file_resp.raise_for_status()
 
             file_name = f"{productid}.sdmx.zip"
             content_type = "application/zip"
@@ -129,9 +131,11 @@ def main():
 
             with conn.cursor() as cur:
                 log_result(cur, productid, status, file_hash=file_hash)
-
+        
         except Exception as e:
             try:
+                if conn.closed == 0:
+                    conn.rollback()  # reset broken transaction
                 with conn.cursor() as cur:
                     log_result(cur, productid, "error", notes=str(e))
                 conn.commit()
