@@ -5,7 +5,7 @@ Downloads and archives all StatCan cubes listed in spine.cube
 using the getFullTableDownloadSDMX endpoint.
 
 - Handles duplicates (skips if already archived)
-- Logs success, duplicate, not found, and error statuses
+- Logs success, duplicate, not found, skipped, and error statuses
 - Throttles requests to avoid overwhelming the API
 - Can safely resume ingestion by checking archive.ingest_log
 - Writes human-readable log to logs/bulk_ingest.log
@@ -30,6 +30,7 @@ DB_PORT = os.getenv("DB_PORT", "5432")
 
 SDMX_ENDPOINT = "https://www150.statcan.gc.ca/t1/wds/rest/getFullTableDownloadSDMX/{}"
 DELAY_SECONDS = 5  # More conservative delay to avoid hitting StatCan too fast
+MAX_BYTES = 800 * 1024 * 1024  # 800 MB safety buffer
 
 # Setup file + console logging
 log_dir = os.path.join(os.path.dirname(__file__), '..', 'logs')
@@ -75,7 +76,6 @@ def main():
                 WHERE status IN ('success', 'duplicate')
             )
             ORDER BY productid
-            
         """)
         rows = cur.fetchall()
         product_ids = [r[0] for r in rows]
@@ -99,6 +99,13 @@ def main():
             file_resp = requests.get(file_url)
             file_resp.raise_for_status()
             file_bytes = file_resp.content
+
+            if len(file_bytes) >= MAX_BYTES:
+                with conn.cursor() as cur:
+                    log_result(cur, productid, "skipped", notes=f"File too large: {len(file_bytes)} bytes")
+                logger.warning(f"🚫 Skipping {productid}.sdmx.zip: file too large ({len(file_bytes)} bytes)")
+                conn.commit()
+                continue
 
             file_name = f"{productid}.sdmx.zip"
             content_type = "application/zip"
@@ -124,8 +131,12 @@ def main():
                 log_result(cur, productid, status, file_hash=file_hash)
 
         except Exception as e:
-            with conn.cursor() as cur:
-                log_result(cur, productid, "error", notes=str(e))
+            try:
+                with conn.cursor() as cur:
+                    log_result(cur, productid, "error", notes=str(e))
+                conn.commit()
+            except Exception as log_err:
+                logger.error(f"⚠️ Failed to log error for {productid}: {log_err}")
             logger.error(f"❌ Error on {productid}: {e}")
 
         conn.commit()
