@@ -1,36 +1,43 @@
-
 """
 archive_ingester.py
 
-This module handles ingestion of raw files into the `archive.raw_file` table
-in the PostgreSQL database. Files are hashed using SHA-256 to prevent duplicates
-and are stored as binary (BYTEA), along with metadata such as file name,
-content type, size, and source URL.
+Handles ingestion of raw files into the `archive.raw_file` table.
+Files are hashed using SHA-256 to prevent duplicates and are stored as binary (BYTEA),
+along with metadata: file name, content type, size, and source URL.
 
-Core features:
-- Hash-based deduplication of files
-- Ingest from local disk or in-memory bytes (e.g., API responses)
-- Store metadata alongside content for traceability
-
-Intended for use within ETL scripts to ensure consistent, centralized storage
-of raw source files prior to processing.
-
-Planned extensions:
-- Retrieval functions by hash, ID, or file name
-- Decompression / staging hooks
-- Validation or annotation tools for archived data
+Supports ingestion from in-memory bytes, suitable for raw downloads from APIs.
 """
 
-def ingest_file_from_bytes(file_bytes, file_name, conn, source_url=None, content_type="application/octet-stream"):
-    import hashlib
+import hashlib
+import mimetypes
 
-    h = hashlib.sha256(file_bytes).hexdigest()
+def infer_content_type(file_name):
+    mime, _ = mimetypes.guess_type(file_name)
+    return mime or "application/octet-stream"
+
+
+def ingest_file_from_bytes(file_bytes, file_name, conn, source_url=None, content_type=None):
+    """
+    Ingest a file into the archive.raw_file table.
+
+    Args:
+        file_bytes (bytes): Raw file content
+        file_name (str): File name to store
+        conn: psycopg2 connection
+        source_url (str): Optional URL of origin
+        content_type (str): Optional MIME type (guessed if not provided)
+
+    Returns:
+        bool: True if inserted, False if duplicate
+    """
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
     size = len(file_bytes)
+    content_type = content_type or infer_content_type(file_name)
 
     with conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM archive.raw_file WHERE file_hash = %s", (h,))
+        cur.execute("SELECT 1 FROM archive.raw_file WHERE file_hash = %s", (file_hash,))
         if cur.fetchone():
-            print(f"Duplicate: {file_name} already ingested.")
+            print(f"🔁 Duplicate: {file_name} already ingested.")
             return False
 
         cur.execute("""
@@ -38,32 +45,24 @@ def ingest_file_from_bytes(file_bytes, file_name, conn, source_url=None, content
                 file_hash, file_name, content, content_type,
                 size_bytes, source_url
             ) VALUES (%s, %s, %s, %s, %s, %s)
-        """, (h, file_name, file_bytes, content_type, size, source_url))
+        """, (file_hash, file_name, file_bytes, content_type, size, source_url))
 
     conn.commit()
-    print(f"Ingested from bytes: {file_name}")
+    print(f"✅ Ingested: {file_name} ({content_type}, {size} bytes)")
     return True
+
 
 def get_file_from_archive(conn, *, file_hash=None, file_name=None):
     """
     Retrieve a file's raw content and metadata from the archive.
 
     Args:
-        conn: psycopg2 connection object
-        file_hash (str): Optional SHA-256 hash of the file to retrieve
-        file_name (str): Optional file name to retrieve (ignored if hash is given)
+        conn: psycopg2 connection
+        file_hash (str): Optional SHA-256 hash
+        file_name (str): Optional name (ignored if hash is given)
 
     Returns:
-        dict: {
-            'file_name': str,
-            'file_hash': str,
-            'content': bytes,
-            'content_type': str,
-            'size_bytes': int,
-            'source_url': str,
-            'created_at': datetime
-        }
-        or None if no match found
+        dict or None
     """
     with conn.cursor() as cur:
         if file_hash:
@@ -89,7 +88,7 @@ def get_file_from_archive(conn, *, file_hash=None, file_name=None):
             return {
                 "file_name": row[0],
                 "file_hash": row[1],
-                "content": bytes(row[2]),  # 🔥 decode memoryview here
+                "content": bytes(row[2]),  # decode memoryview
                 "content_type": row[3],
                 "size_bytes": row[4],
                 "source_url": row[5],

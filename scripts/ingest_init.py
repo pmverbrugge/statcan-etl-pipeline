@@ -48,7 +48,8 @@ DB_PASSWORD = os.getenv("POSTGRES_PASSWORD")
 DB_HOST = os.getenv("POSTGRESS", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
 
-STATCAN_URL = "https://www150.statcan.gc.ca/t1/wds/rest/getFullTableDownloadSDMX/14100287"
+STATCAN_URL="https://www150.statcan.gc.ca/t1/wds/rest/getFullTableDownloadSDMX/35100027"
+
 FILENAME = "3510002701.sdmx.zip"
 
 def main():
@@ -66,7 +67,11 @@ def main():
     resp = requests.get(STATCAN_URL)
     resp.raise_for_status()
     result = resp.json()
-    file_url = result["object"]["downloadURL"]
+
+    if not isinstance(result, dict) or "object" not in result:
+        raise ValueError(f"Unexpected JSON structure: {result}")
+
+    file_url = result["object"]  # direct string, not a dict
     content_type = "application/zip"
 
     # Download the SDMX ZIP file
@@ -94,4 +99,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+resp = requests.get(STATCAN_URL)
+resp.raise_for_status()
+
 
