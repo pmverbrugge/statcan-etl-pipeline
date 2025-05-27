@@ -43,10 +43,16 @@ def fetch_json(url: str) -> dict:
         logger.error(f"Failed to fetch data: {e}")
         raise
 
-def stage_base_data(json_bytes: bytes):
-    """Load raw JSON into DuckDB and define views."""
-    con.sql("INSTALL json; LOAD json;")
+def normalize_datetime(df: pd.DataFrame) -> pd.DataFrame:
+    """Replace NaT and format datetime columns."""
+    df = df.replace({pd.NaT: None, "NaT": None})
+    for col in df.select_dtypes(include=["datetime64[ns]"]):
+        df[col] = df[col].apply(lambda x: x.strftime("%Y-%m-%d %H:%M:%S") if pd.notnull(x) else None)
+    return df
 
+def stage_base_data(json_bytes: bytes) -> str:
+    """Load raw JSON into DuckDB and define views. Return path to temp file."""
+    con.sql("INSTALL json; LOAD json;")
     with tempfile.NamedTemporaryFile(mode="w+", suffix=".json", delete=False) as f:
         f.write(json_bytes.decode("utf-8"))
         f.flush()
@@ -108,6 +114,7 @@ def stage_base_data(json_bytes: bytes):
     """)
 
     logger.info("Created staging views in DuckDB.")
+    return json_path
 
 def insert_spine_tables():
     """Insert staged data from DuckDB into Postgres spine tables."""
@@ -115,7 +122,10 @@ def insert_spine_tables():
 
     with psycopg2.connect(**DB_CONFIG) as pg:
         with pg.cursor() as cur:
-            cur.execute("TRUNCATE spine.cube, spine.cube_subject, spine.cube_survey, spine.cube_dimension, spine.cube_correction")
+            cur.execute("""
+            TRUNCATE TABLE spine.cube, spine.cube_subject, spine.cube_survey, 
+                           spine.cube_dimension, spine.cube_correction
+            """)
             logger.info("Truncated spine tables.")
 
             for table in tables:
@@ -124,12 +134,7 @@ def insert_spine_tables():
                     logger.warning(f"Skipping {table}: no data.")
                     continue
 
-                # Normalize datetime and missing values
-                                # Normalize datetime and missing values
-                df = df.replace({pd.NaT: None, "NaT": None})
-                for col in df.select_dtypes(include=["datetime64[ns]"]):
-                    df[col] = df[col].apply(lambda x: x.strftime("%Y-%m-%d %H:%M:%S") if isinstance(x, pd.Timestamp) and not pd.isnull(x) else None)
-
+                df = normalize_datetime(df)
                 columns = ','.join(df.columns)
                 values = [tuple(row) for row in df.itertuples(index=False)]
                 sql = f"INSERT INTO spine.{table} ({columns}) VALUES %s"
@@ -143,40 +148,47 @@ def insert_spine_tables():
 # ------------------ #
 
 def main():
-    logger.info("Starting StatCan spine ETL...")
+    json_path = None
+    try:
+        logger.info("Starting StatCan spine ETL...")
 
-    if os.path.exists(CACHE_PATH):
-        with open(CACHE_PATH, "rb") as f:
-            json_bytes = f.read()
-        logger.info("Loaded JSON data from local cache.")
-    else:
-        data = fetch_json(WDS_ENDPOINT)
-        json_bytes = json.dumps(data, indent=2).encode("utf-8")
-        with open(CACHE_PATH, "wb") as f:
-            f.write(json_bytes)
-        logger.info("Fetched and cached JSON data from StatCan.")
-
-    file_name = "cubes_list.json"
-    source_url = WDS_ENDPOINT
-
-    with psycopg2.connect(**DB_CONFIG) as conn:
-        ingested = ingest_file_from_bytes(
-            file_bytes=json_bytes,
-            file_name=file_name,
-            conn=conn,
-            source_url=source_url,
-            content_type="application/json"
-        )
-        if ingested:
-            logger.info(f"Ingested response to archive as {file_name}")
+        if os.path.exists(CACHE_PATH):
+            with open(CACHE_PATH, "rb") as f:
+                json_bytes = f.read()
+            logger.info("Loaded JSON data from local cache.")
         else:
-            logger.info(f"Duplicate response skipped for {file_name}")
+            data = fetch_json(WDS_ENDPOINT)
+            json_bytes = json.dumps(data, indent=2).encode("utf-8")
+            with open(CACHE_PATH, "wb") as f:
+                f.write(json_bytes)
+            logger.info("Fetched and cached JSON data from StatCan.")
 
-    stage_base_data(json_bytes)
-    insert_spine_tables()
+        file_name = "cubes_list.json"
+        source_url = WDS_ENDPOINT
 
-    logger.info("ETL complete. Spine tables populated.")
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            ingested = ingest_file_from_bytes(
+                file_bytes=json_bytes,
+                file_name=file_name,
+                conn=conn,
+                source_url=source_url,
+                content_type="application/json"
+            )
+            if ingested:
+                logger.info(f"Ingested response to archive as {file_name}")
+            else:
+                logger.info(f"Duplicate response skipped for {file_name}")
 
+        json_path = stage_base_data(json_bytes)
+        insert_spine_tables()
+        logger.info("ETL complete. Spine tables populated.")
+    except Exception as e:
+        logger.exception("Pipeline failed.")
+        raise
+    finally:
+        con.close()
+        if json_path and os.path.exists(json_path):
+            os.remove(json_path)
 
 if __name__ == "__main__":
     main()
