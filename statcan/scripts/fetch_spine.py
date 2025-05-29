@@ -62,7 +62,7 @@ def main():
     try:
         data = fetch_json()
         file_hash = hash_json(data)
-        file_path = f"/app/raw/statcan/metadata/spine_{file_hash[:16]}.json"
+        file_path = f"{ARCHIVE_DIR}/spine_{file_hash[:16]}.json"
 
         with psycopg2.connect(**DB_CONFIG) as conn:
             with conn.cursor() as cur:
