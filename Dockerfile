@@ -7,13 +7,9 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# ✅ This stays cached until requirements.txt changes
+# Install requirements
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-# 🔄 These change more often — placed after pip install
-COPY ./scripts /app/scripts
-COPY ./lib /app/lib
 
 ENV PYTHONPATH=/app
 

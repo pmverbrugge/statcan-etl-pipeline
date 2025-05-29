@@ -1,0 +1,23 @@
+services:
+  etl:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: etl-${AGENCY}
+    working_dir: /app
+    volumes:
+      - ./${AGENCY}/:/app/${AGENCY}
+      - ./shared/:/app/shared
+      - ../logs/${AGENCY}/:/app/logs
+      - ../raw/${AGENCY}/:/app/raw
+    environment:
+      AGENCY: ${AGENCY}
+    networks:
+      - datanet
+    stdin_open: true
+    tty: true
+
+networks:
+  datanet:
+    external: true
+
