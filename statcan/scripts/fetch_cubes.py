@@ -17,7 +17,7 @@ import time
 
 WDS_URL_TEMPLATE = "https://www150.statcan.gc.ca/t1/wds/rest/getFullTableDownloadSDMX/{}"
 DOWNLOAD_DIR = Path("/app/raw/cubes")
-MAX_CUBES = 128
+MAX_CUBES = None
 
 logger.add("/app/logs/fetch_cubes.log", rotation="10 MB", retention="7 days")
 
