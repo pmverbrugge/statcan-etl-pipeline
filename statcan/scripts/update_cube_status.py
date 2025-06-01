@@ -1,10 +1,10 @@
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
 from statcan.tools.config import DB_CONFIG
 from loguru import logger
-import time
+from time import sleep 
 
 logger.add("/app/logs/update_cube_status.log", rotation="10 MB", retention="7 days")
 
@@ -57,13 +57,18 @@ def update_cube_status(cur):
         );
     """)
 
+def get_effective_statcan_date() -> date:
+    now = datetime.now(timezone.utc)
+    cutoff = time(13, 30)  # 08:30 EST == 13:30 UTC
+    return now.date() if now.time() >= cutoff else now.date() - timedelta(days=1)
+
 def main():
     logger.info("🚦 Starting update checker...")
     try:
         with psycopg2.connect(**DB_CONFIG) as conn:
             with conn.cursor() as cur:
                 last_checked = get_last_checked_date(cur)
-                today = date.today()
+                today = get_effective_statcan_date()
 
                 logger.info(f"📅 Last checked date: {last_checked}, checking through {today}.")
 
@@ -76,7 +81,7 @@ def main():
                         insert_changes(cur, changes)
                         logger.info(f"📅 {d}: {len(changes)} changes recorded.")
                         conn.commit()
-                        time.sleep(SLEEP_SECONDS)
+                        sleep(SLEEP_SECONDS)
                     except Exception as e:
                         logger.warning(f"⚠️ Failed to process {d}: {e}")
                         conn.rollback()
