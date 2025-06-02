@@ -1,6 +1,6 @@
 """
 Download StatCan data cubes (limited test run).
-Uses getFullTableDownloadSDMX endpoint to download cube zip files.
+Uses getFullTableDownloadCSV endpoint to download cube zip files.
 Updates raw_files.manage_cube_raw_files and cube_status.
 """
 
@@ -15,7 +15,7 @@ from statcan.tools.config import DB_CONFIG
 import time
 
 
-WDS_URL_TEMPLATE = "https://www150.statcan.gc.ca/t1/wds/rest/getFullTableDownloadSDMX/{}"
+WDS_URL_TEMPLATE = "https://www150.statcan.gc.ca/t1/wds/rest/getFullTableDownloadCSV/{}/en"
 DOWNLOAD_DIR = Path("/app/raw/cubes")
 MAX_CUBES = None
 
