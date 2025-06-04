@@ -1,111 +1,121 @@
-import psycopg2
-from collections import defaultdict, Counter
-from loguru import logger
 import hashlib
+import pandas as pd
+import psycopg2
+from collections import Counter
+from loguru import logger
 from statcan.tools.config import DB_CONFIG
 
-logger.add("/app/logs/build_dimension_registry.log", rotation="1 MB", retention="7 days")
+logger.add("/app/logs/build_dim_registry.log", rotation="1 MB", retention="7 days")
+
 
 def normalize(text):
-    return str(text or '').strip().lower()
+    return str(text or "").strip().lower()
 
-def hash_member(code, label_en):
-    return hashlib.sha256(f"{normalize(code)}|{normalize(label_en)}".encode("utf-8")).hexdigest()
 
-def hash_dimension(member_list):
-    sorted_items = sorted((hash_member(m[0], m[1]) for m in member_list))
-    return hashlib.sha256("|".join(sorted_items).encode("utf-8")).hexdigest()
+def hash_key_value(code, label_en, parent_id=None, uom_code=None):
+    key = f"{normalize(code)}|{normalize(label_en)}|{normalize(parent_id)}|{normalize(uom_code)}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
-def detect_total(label):
-    return normalize(label) in {"total", "all", "overall", "toutes", "tous", "ensemble"}
 
-def main():
+def hash_dimension(member_hashes):
+    sorted_hashes = sorted(member_hashes)
+    return hashlib.sha256("|".join(sorted_hashes).encode("utf-8")).hexdigest()
+
+
+def get_db_conn():
+    return psycopg2.connect(**DB_CONFIG)
+
+
+def build_dimension_registry():
     logger.info("🚀 Starting dimension registry build...")
-    try:
-        with psycopg2.connect(**DB_CONFIG) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT productid, dimension_position, classification_code,
-                           classification_type_code, member_id, member_name_en,
-                           member_name_fr, member_uom_code, parent_member_id,
-                           geo_level, vintage, terminated
-                    FROM dictionary.raw_member
-                """)
-                raw_members = cur.fetchall()
+    
+    with get_db_conn() as conn:
+        cur = conn.cursor()
 
-                member_dict = defaultdict(list)
-                for row in raw_members:
-                    pid, dpos = row[0], row[1]
-                    member_dict[(pid, dpos)].append(row[2:])
+        raw_member = pd.read_sql("SELECT * FROM dictionary.raw_member", conn)
+        raw_dim = pd.read_sql("SELECT * FROM dictionary.raw_dimension", conn)
 
-                seen_dimensions = {}
-                seen_members = set()
-                label_counter_en = defaultdict(Counter)
-                label_counter_fr = defaultdict(Counter)
-                pending_member_inserts = {}
+        # Step 1: Normalize and hash code-label pairs
+        raw_member["key_value_hash"] = raw_member.apply(
+            lambda row: hash_key_value(
+                row["member_id"],
+                row["member_name_en"],
+                row["parent_member_id"],
+                row["member_uom_code"]
+            ), axis=1
+        )
 
-                for (pid, dpos), members in member_dict.items():
-                    dim_hash = hash_dimension(members)
+        # Step 2: Create dimension-level hash
+        grouped = raw_member.groupby(["productid", "dimension_position"])['key_value_hash'].apply(list).reset_index()
+        grouped["dimension_hash"] = grouped["key_value_hash"].apply(hash_dimension)
 
-                    if dim_hash not in seen_dimensions:
-                        cur.execute("""
-                            INSERT INTO dictionary.dimension_set (
-                                dimension_hash
-                            ) VALUES (%s)
-                            ON CONFLICT DO NOTHING
-                        """, (dim_hash,))
-                        seen_dimensions[dim_hash] = True
+        # Step 3: Join dimension_hash back to raw_member
+        raw_member = raw_member.merge(grouped[["productid", "dimension_position", "dimension_hash"]], 
+                                      on=["productid", "dimension_position"], how="left")
 
-                    for m in members:
-                        if len(m) < 5:
-                            logger.warning(f"Skipping incomplete member row: {m}")
-                            continue
+        # Step 4: Select most common English label for each code, include French
+        label_counts = (
+            raw_member.groupby(["dimension_hash", "member_id", "member_name_en", "member_name_fr"])
+            .size().reset_index(name="count")
+            .sort_values(["dimension_hash", "member_id", "count"], ascending=[True, True, False])
+        )
+        core_members = label_counts.drop_duplicates(subset=["dimension_hash", "member_id"])
 
-                        code, label_en, label_fr = m[0], m[2], m[3]
-                        mem_hash = hash_member(code, label_en)
+        # Add member_hash column (reusing earlier value)
+        core_members = core_members.merge(
+            raw_member[["dimension_hash", "member_id", "key_value_hash"]],
+            on=["dimension_hash", "member_id"],
+            how="left"
+        ).rename(columns={"key_value_hash": "member_hash"})
 
-                        label_counter_en[mem_hash][label_en] += 1
-                        label_counter_fr[mem_hash][label_fr] += 1
+        # Step 5: Select most common English dimension name
+        raw_dim = raw_dim.merge(grouped, on=["productid", "dimension_position"], how="left")
+        core_dims = (
+            raw_dim.groupby(["dimension_hash", "dimension_name_en"])
+            .size().reset_index(name="count")
+            .sort_values(["dimension_hash", "count"], ascending=[True, False])
+            .drop_duplicates(subset=["dimension_hash"])
+        )
 
-                        if mem_hash not in seen_members:
-                            seen_members.add(mem_hash)
-                            pending_member_inserts[mem_hash] = (dim_hash, mem_hash, m)
- mem_hash, (dim_hash, mem_hash, m) in pending_member_inserts.items():
-                    if len(m) < 9:
-                        logger.warning(f"Skipping malformed member tuple (len={len(m)}): {m}")
-                        continue
+        # Step 6: Flagging logic
+        core_members.loc[:, "is_total"] = core_members["member_name_en"].str.contains("total", case=False, na=False)
+        core_dims["has_total"] = core_members.groupby("dimension_hash")["is_total"].any().values
+        core_dims["is_exclusive"] = False  # placeholder
+        core_dims["is_grabbag"] = core_dims["dimension_name_en"].str.contains("characteristics|other", case=False, na=False)
+        core_dims["is_tree"] = raw_member.groupby("dimension_hash")['parent_member_id'].apply(lambda x: x.notna().any()).values
 
-                    best_en = label_counter_en[mem_hash].most_common(1)[0][0]
-                    best_fr = label_counter_fr[mem_hash].most_common(1)[0][0]
-                    is_total = detect_total(best_en)
+        # Step 7: Insert data
+        logger.info("🧩 Inserting into dictionary.dimension_set")
+        for _, row in core_dims.iterrows():
+            cur.execute("""
+                INSERT INTO dictionary.dimension_set (dimension_hash, dimension_name_en, has_total, is_exclusive, is_grabbag, is_tree)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (dimension_hash) DO NOTHING
+            """, (row["dimension_hash"], row["dimension_name_en"], row["has_total"], row["is_exclusive"], row["is_grabbag"], row["is_tree"]))
 
-                    cur.execute("""
-                        INSERT INTO dictionary.dimension_member (
-                            dimension_hash, member_hash, member_id, classification_code,
-                            classification_type_code, member_name_en, member_name_fr,
-                            member_uom_code, parent_member_id, geo_level, vintage,
-                            terminated, is_total
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT DO NOTHING
-                    """, (
-                        dim_hash, mem_hash,
-                        m[2] if len(m) > 2 else None,
-                        m[0] if len(m) > 0 else None,
-                        m[1] if len(m) > 1 else None,
-                        best_en, best_fr,
-                        m[4] if len(m) > 4 else None,
-                        m[5] if len(m) > 5 else None,
-                        m[6] if len(m) > 6 else None,
-                        m[7] if len(m) > 7 else None,
-                       bool(m[8]) if len(m) > 8 else None,
-                        is_total
-                    ))
+        logger.info("🧩 Inserting into dictionary.dimension_set_member")
+        for _, row in core_members.iterrows():
+            cur.execute("""
+                INSERT INTO dictionary.dimension_set_member (dimension_hash, member_id, member_hash, member_name_en, member_name_fr, is_total)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (dimension_hash, member_id) DO NOTHING
+            """, (row["dimension_hash"], row["member_id"], row["member_hash"], row["member_name_en"], row["member_name_fr"], row["is_total"]))
 
-        logger.success("✅ Dimension registry build complete.")
+        logger.info("🧩 Inserting into cube.cube_dimension_map")
+        for _, row in grouped.iterrows():
+            cur.execute("""
+                INSERT INTO cube.cube_dimension_map (productid, dimension_position, dimension_hash)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (productid, dimension_position) DO NOTHING
+            """, (row["productid"], row["dimension_position"], row["dimension_hash"]))
 
-    except Exception as e:
-        logger.exception(f"❌ Failed to build dimension registry: {e}")
+        conn.commit()
+        logger.info("✅ Dimension registry inserted into DB.")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        build_dimension_registry()
+    except Exception as e:
+        logger.error(f"❌ Failed to build dimension registry: {e}")
 
