@@ -13,7 +13,7 @@ def hash_member(code, label_en):
     return hashlib.sha256(f"{normalize(code)}|{normalize(label_en)}".encode("utf-8")).hexdigest()
 
 def hash_dimension(member_list):
-    sorted_items = sorted((hash_member(m[0], m[2]) for m in member_list))
+    sorted_items = sorted((hash_member(m[0], m[1]) for m in member_list))
     return hashlib.sha256("|".join(sorted_items).encode("utf-8")).hexdigest()
 
 def detect_total(label):
@@ -70,8 +70,7 @@ def main():
                         if mem_hash not in seen_members:
                             seen_members.add(mem_hash)
                             pending_member_inserts[mem_hash] = (dim_hash, mem_hash, m)
-
-                for mem_hash, (dim_hash, mem_hash, m) in pending_member_inserts.items():
+ mem_hash, (dim_hash, mem_hash, m) in pending_member_inserts.items():
                     if len(m) < 9:
                         logger.warning(f"Skipping malformed member tuple (len={len(m)}): {m}")
                         continue

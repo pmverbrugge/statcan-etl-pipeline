@@ -1,0 +1,11 @@
+
+
+# Build dimension registry 
+
+1. Working with raw_member, normalize key value pairs and hash them - return productid, dimesion_position, key_value_hash
+2. Transpose key_value_hashes as list to the (productid, dimension_position), sort the list, then hash the list to create a dimension level hash that identifies a dimension set. 
+3. Join the dimension set hash to raw_member by (productid, dimension_position)
+4. Flag the most common english label within (dimension_hash, code_value) and reduce to those records - this is the core of dimension_set_member.
+5. Join the dimension level hash back to raw_dimension - flag and reduce set to the most common english dimension name - this is the core of dimension set. 
+6. Scan across dimension_set member for member-level flag variables and dimension_level flag variables 
+7. Summarize flag variables across dimension_set_member to dimension_set level and join those flags to dimension_set data table. 
