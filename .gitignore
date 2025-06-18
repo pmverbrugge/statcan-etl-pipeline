@@ -1,5 +1,24 @@
+# Create .gitignore to exclude sensitive files
+cat > .gitignore << 'EOF'
+# Database and sensitive files
+../db/postgres/
+../db/init/
+*.env
+**/config.py
+*.duckdb
+
+# Data directories (outside etl but referenced)
+../raw/
+../logs/
+../warehouse/
+../staging/
+
+# Python
 __pycache__/
 *.pyc
-logs/
-.env
-*.duckdb
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+EOF
