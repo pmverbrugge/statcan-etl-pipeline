@@ -1,7 +1,7 @@
 """
-Download StatCan data cubes (limited test run).
+Download StatCan data cubes with granular status tracking.
 Uses getFullTableDownloadCSV endpoint to download cube zip files.
-Updates raw_files.manage_cube_raw_files and cube_status.
+Updates raw_files.manage_cube_raw_files and cube_status progressively.
 """
 
 import os
@@ -32,6 +32,34 @@ def get_pending_cubes(limit=MAX_CUBES):
                 LIMIT %s;
             """, (limit,))
             return [row[0] for row in cur.fetchall()]
+
+
+def mark_download_started(productid: int):
+    """Mark that download has started for a productid"""
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE raw_files.cube_status
+                SET last_download = now()
+                WHERE productid = %s;
+            """, (productid,))
+            conn.commit()
+            logger.info(f"🚀 Marked download started for {productid}")
+
+
+def mark_download_failed(productid: int, error_msg: str):
+    """Mark that download failed for a productid"""
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            # Keep download_pending = TRUE so it gets retried
+            # Update last_download to track the attempt
+            cur.execute("""
+                UPDATE raw_files.cube_status
+                SET last_download = now()
+                WHERE productid = %s;
+            """, (productid,))
+            conn.commit()
+            logger.error(f"❌ Marked download failed for {productid}: {error_msg}")
 
 
 def get_download_url(productid: int) -> str:
@@ -77,38 +105,76 @@ def insert_log(cur, productid: int, file_hash: str, file_path: str):
     """, (productid, file_hash, file_path))
 
 
-def update_status(cur, productid: int):
+def update_status_complete(cur, productid: int):
+    """Mark download as successfully completed"""
     cur.execute("""
         UPDATE raw_files.cube_status
-        SET download_pending = FALSE, last_download = now(), last_file_hash = (
-            SELECT file_hash FROM raw_files.manage_cube_raw_files
-            WHERE productid = %s AND active = TRUE
-        )
+        SET download_pending = FALSE, 
+            last_download = now(), 
+            last_file_hash = (
+                SELECT file_hash FROM raw_files.manage_cube_raw_files
+                WHERE productid = %s AND active = TRUE
+            )
         WHERE productid = %s;
     """, (productid, productid))
 
 
 def download_and_log(productid: int):
-    logger.info(f"🔽 Downloading cube {productid}...")
-    url = get_download_url(productid)
-    resp = requests.get(url)
-    resp.raise_for_status()
-    file_bytes = resp.content
-    file_hash = hash_bytes(file_bytes)
-
-    with psycopg2.connect(**DB_CONFIG) as conn:
-        with conn.cursor() as cur:
-            if file_exists(cur, file_hash):
-                logger.warning(f"⚠️  Duplicate file for {productid}; skipping.")
-                update_status(cur, productid)
+    logger.info(f"🔽 Starting download for cube {productid}...")
+    
+    # Step 1: Mark download started
+    try:
+        mark_download_started(productid)
+    except Exception as e:
+        logger.error(f"❌ Failed to mark download started for {productid}: {e}")
+        return
+    
+    # Step 2: Get download URL
+    try:
+        url = get_download_url(productid)
+        logger.info(f"📡 Got download URL for {productid}")
+    except Exception as e:
+        mark_download_failed(productid, f"Failed to get download URL: {e}")
+        return
+    
+    # Step 3: Download file content
+    try:
+        resp = requests.get(url, timeout=300)  # 5 minute timeout
+        resp.raise_for_status()
+        file_bytes = resp.content
+        file_hash = hash_bytes(file_bytes)
+        logger.info(f"⬇️ Downloaded {len(file_bytes)} bytes for {productid}, hash: {file_hash[:16]}")
+    except Exception as e:
+        mark_download_failed(productid, f"Failed to download file: {e}")
+        return
+    
+    # Step 4: Check for duplicates and save/log
+    try:
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor() as cur:
+                if file_exists(cur, file_hash):
+                    logger.warning(f"⚠️ Duplicate file for {productid} (hash: {file_hash[:16]}), updating status only")
+                    update_status_complete(cur, productid)
+                    conn.commit()
+                    logger.success(f"✅ Updated status for duplicate {productid}")
+                    return
+                
+                # Save file to disk
+                file_path = save_file(productid, file_hash, file_bytes)
+                logger.info(f"💾 Saved file for {productid} to {file_path}")
+                
+                # Log file in database
+                insert_log(cur, productid, file_hash, file_path)
+                logger.info(f"📝 Logged file for {productid} in database")
+                
+                # Mark download complete
+                update_status_complete(cur, productid)
                 conn.commit()
-                return
-
-            file_path = save_file(productid, file_hash, file_bytes)
-            insert_log(cur, productid, file_hash, file_path)
-            update_status(cur, productid)
-            conn.commit()
-            logger.success(f"✅ Downloaded and logged {productid} to {file_path}")
+                logger.success(f"✅ Completed download and logging for {productid}")
+                
+    except Exception as e:
+        mark_download_failed(productid, f"Failed to save/log file: {e}")
+        return
 
 
 def main():
@@ -118,12 +184,19 @@ def main():
         if not product_ids:
             logger.info("🎉 No cubes pending download.")
             return
-        for pid in product_ids:
+        
+        logger.info(f"📋 Found {len(product_ids)} cubes pending download")
+        
+        for i, pid in enumerate(product_ids, 1):
+            logger.info(f"🔄 Processing cube {i}/{len(product_ids)}: {pid}")
             try:
                 download_and_log(pid)
-                time.sleep(2) # polite pause
+                time.sleep(2)  # polite pause
             except Exception as e:
-                logger.error(f"❌ Failed to process cube {pid}: {e}")
+                logger.error(f"❌ Unexpected error processing cube {pid}: {e}")
+                # Continue with next cube rather than stopping entire batch
+                continue
+                
         logger.info("✅ Batch download complete.")
     except Exception as e:
         logger.exception(f"❌ Download pipeline failed: {e}")
@@ -131,4 +204,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
