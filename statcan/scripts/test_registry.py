@@ -1,14 +1,14 @@
 import zipfile
 import pandas as pd
-import hashlib
 import psycopg2
 from statcan.tools.config import DB_CONFIG
+from loguru import logger
+from collections import defaultdict, Counter
+
+logger.add("/app/logs/validate_registry.log", rotation="1 MB", retention="7 days")
 
 def normalize(text):
-    return str(text or "").strip().lower()
-
-def hash_key_value(code, label_en):
-    return hashlib.sha256(f"{normalize(code)}|{normalize(label_en)}".encode("utf-8")).hexdigest()
+    return str(text or "").strip().lower().replace("\u00a0", " ")  # handle non-breaking spaces
 
 def get_csv_from_zip(product_id, conn):
     with conn.cursor() as cur:
@@ -25,79 +25,108 @@ def get_csv_from_zip(product_id, conn):
             df = pd.read_csv(f)
     return df
 
-
-def get_dimension_order(product_id, conn):
+def get_dimension_map(product_id, conn):
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT c.dimension_position, s.base_name, c.dimension_hash
-            FROM dictionary.cube_dimension_map c
-            JOIN dictionary.dimension_set s ON c.dimension_hash = s.dimension_hash
-            WHERE c.productid = %s
-            ORDER BY c.dimension_position;
+            SELECT dimension_position, dimension_name_slug, dimension_hash
+            FROM cube.cube_dimension_map
+            WHERE productid = %s
+            ORDER BY dimension_position ASC;
         """, (product_id,))
         return cur.fetchall()
 
-
-def get_members_by_hash(conn, dimension_hash):
+def get_member_lookup(conn, dimension_hash):
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT member_id, member_name_en, member_hash
+            SELECT member_id, member_label_norm
             FROM dictionary.dimension_set_member
             WHERE dimension_hash = %s;
         """, (dimension_hash,))
-        return { (member_id, normalize(label)): h for member_id, label, h in cur.fetchall() }
+        return {normalize(label): (member_id, label) for member_id, label in cur.fetchall()}
 
-def validate_row(row, coordinate_parts, dim_order, member_lookup):
+def resolve_label_columns(df, dim_order):
+    label_columns = [col for col in df.columns if col not in ('REF_DATE', 'COORDINATE')]
+    coord_parts_list = df['COORDINATE'].dropna().apply(lambda x: str(x).split("."))
+    candidate_mappings = {}
+
+    for i, (_, slug, _) in enumerate(dim_order):
+        codes = coord_parts_list.map(lambda parts: parts[i] if i < len(parts) else None)
+        for col in label_columns:
+            pairs = list(zip(codes, df[col]))
+            code_to_label = defaultdict(set)
+            label_to_code = defaultdict(set)
+            for code, label in pairs:
+                code_to_label[code].add(normalize(label))
+                label_to_code[normalize(label)].add(code)
+
+            if all(len(v) == 1 for v in code_to_label.values()) and all(len(v) == 1 for v in label_to_code.values()):
+                candidate_mappings[i] = col
+                break
+
+    return candidate_mappings
+
+def validate_row(row, dim_order, member_lookups, label_map):
     mismatches = []
-    for i, (pos, dim_name, dim_hash) in enumerate(dim_order):
-        label = row[dim_name]
-        label_n = normalize(label)
-        coord_idx = int(coordinate_parts[i])
-        member_id = coord_idx  # assumes 1-based indexing = member_id
-        actual_hash = hash_key_value(member_id, label_n)
-        expected_hash = member_lookup[dim_hash].get((member_id, label_n))
-        if actual_hash != expected_hash:
+    coord_parts = str(row["COORDINATE"]).split(".")
+
+    for i, (pos, slug, dim_hash) in enumerate(dim_order):
+        if i not in label_map:
+            continue
+        label_col = label_map[i]
+        raw_label = row[label_col]
+        label_norm = normalize(raw_label)
+        lookup = member_lookups.get(dim_hash, {})
+        matched = lookup.get(label_norm)
+
+        if not matched:
             mismatches.append({
-                "dimension": dim_name,
-                "member_id": member_id,
-                "label": label,
-                "computed_hash": actual_hash,
-                "expected_hash": expected_hash
+                "dimension": slug,
+                "label": raw_label,
+                "norm": label_norm,
+                "expected": next(iter(lookup.values()), (None, ""))[1],
+                "member_id": next(iter(lookup.values()), (None,))[0],
             })
+
     return mismatches
 
-def run_validation(product_id="13100653", max_rows=50):
-    conn = psycopg2.connect(**DB_CONFIG)
-    df = get_csv_from_zip(product_id, conn)
-    dim_order = get_dimension_order(product_id, conn)
-    member_lookup = {
-        dim_hash: get_members_by_hash(conn, dim_hash)
-        for _, _, dim_hash in dim_order
-    }
+def run_validation(conn, product_id, max_rows=50):
+    logger.info(f"🔍 Validating productId: {product_id}")
+    try:
+        df = get_csv_from_zip(product_id, conn)
+        dim_order = get_dimension_map(product_id, conn)
+        member_lookups = {
+            dim_hash: get_member_lookup(conn, dim_hash)
+            for _, _, dim_hash in dim_order
+        }
+        label_map = resolve_label_columns(df, dim_order)
 
-    fails = []
-    for _, row in df.head(max_rows).iterrows():
-        coord = row["COORDINATE"]
-        parts = coord.split(".")
-        if len(parts) != len(dim_order):
-            continue
-        mismatches = validate_row(row, parts, dim_order, member_lookup)
-        if mismatches:
-            fails.append({"row_coord": coord, "issues": mismatches})
+        failures = []
+        for _, row in df.head(max_rows).iterrows():
+            mismatches = validate_row(row, dim_order, member_lookups, label_map)
+            if mismatches:
+                failures.append({"coord": row["COORDINATE"], "issues": mismatches})
 
-    conn.close()
-    if not fails:
-        print("✅ All checked rows matched dimension registry.")
-    else:
-        for fail in fails:
-            print(f"❌ COORDINATE: {fail['row_coord']}")
-            for issue in fail["issues"]:
-                print(f"  - Dimension: {issue['dimension']}")
-                print(f"    Label: '{issue['label']}', ID: {issue['member_id']}")
-                print(f"    Computed: {issue['computed_hash']}")
-                print(f"    Expected: {issue['expected_hash']}")
-        print(f"\n{len(fails)} rows failed out of {max_rows} checked.")
+        if not failures:
+            print("✅ All rows matched.")
+        else:
+            for fail in failures:
+                print(f"❌ COORDINATE: {fail['coord']}")
+                for issue in fail["issues"]:
+                    print(f"  - Dimension: {issue['dimension']}")
+                    print(f"    Label: '{issue['label']}' → Norm: '{issue['norm']}'")
+                    print(f"    Expected: '{issue['expected']}'")
+                    print(f"    ID: {issue['member_id']}")
+
+    except Exception as e:
+        logger.error(f"❌ Error validating {product_id}: {e}")
 
 if __name__ == "__main__":
-    run_validation()
+    conn = psycopg2.connect(**DB_CONFIG)
+    sample_ids = [
+        13100653, 13100667, 27100024, 27100157, 33100701,
+        35100007, 36100208, 37100261, 46100053, 98100060
+    ]
+    for pid in sample_ids:
+        run_validation(conn, pid)
+    conn.close()
 
