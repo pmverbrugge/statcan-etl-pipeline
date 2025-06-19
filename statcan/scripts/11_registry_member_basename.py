@@ -297,7 +297,7 @@ def analyze_normalization_quality(original_labels: pd.Series, base_names: pd.Ser
     
     # Detect conflicts (multiple original labels mapping to same base name)
     base_name_groups = original_labels.groupby(base_names).apply(lambda x: x.unique())
-    conflicts = sum(1 for group in base_name_groups if len(group) > 1 and group.iloc[0] != "")
+    conflicts = sum(1 for group in base_name_groups if len(group) > 1 and group[0] != "")
     conflict_rate = conflicts / unique_base_names if unique_base_names > 0 else 0
     
     # Find most common base names
