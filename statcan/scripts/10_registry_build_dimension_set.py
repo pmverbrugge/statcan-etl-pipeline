@@ -38,8 +38,9 @@ Data Quality Features:
 
 Dependencies: Raw metadata must be loaded via scripts 07-09 before running this script.
 Next Step: Run script 11 to compute normalized base names for semantic grouping.
-"""
 
+Author: Paul Verbrugge with Claude 3.5 Sonnet (v20241022)
+"""
 import hashlib
 import pandas as pd
 import psycopg2
@@ -74,26 +75,32 @@ def build_dimension_registry():
     with get_db_conn() as conn:
         cur = conn.cursor()
         
-        # ALWAYS start fresh - truncate in correct order due to foreign keys
-        logger.info("🧹 Truncating existing registry data...")
-        try:
-            cur.execute("TRUNCATE TABLE cube.cube_dimension_map CASCADE")
-            cur.execute("TRUNCATE TABLE dictionary.dimension_set_member CASCADE")
-            cur.execute("TRUNCATE TABLE dictionary.dimension_set CASCADE")
-            conn.commit()
-            logger.info("✅ Tables truncated successfully")
-        except Exception as e:
-            logger.error(f"Failed to truncate tables: {e}")
-            conn.rollback()
-            raise
+        # Start fresh - truncate in correct order
+        logger.info("🧹 Clearing existing registry data...")
+        cur.execute("TRUNCATE TABLE cube.cube_dimension_map CASCADE")
+        cur.execute("TRUNCATE TABLE dictionary.dimension_set_member CASCADE")
+        cur.execute("TRUNCATE TABLE dictionary.dimension_set CASCADE")
+        conn.commit()
         
-        # Load raw data
+        # Load raw data - CAST to integer in SQL to handle any float values
         logger.info("📊 Loading raw data...")
         raw_member = pd.read_sql("""
-            SELECT productid, dimension_position, member_id, 
-                   parent_member_id, classification_code, classification_type_code,
-                   member_name_en, member_name_fr, member_uom_code,
-                   geo_level, vintage, terminated
+            SELECT 
+                productid,
+                dimension_position,
+                CAST(member_id AS INTEGER) as member_id,
+                CASE 
+                    WHEN parent_member_id IS NULL THEN NULL
+                    ELSE CAST(parent_member_id AS INTEGER)
+                END as parent_member_id,
+                classification_code,
+                classification_type_code,
+                member_name_en,
+                member_name_fr,
+                member_uom_code,
+                CASE WHEN geo_level IS NULL THEN NULL ELSE CAST(geo_level AS INTEGER) END as geo_level,
+                CASE WHEN vintage IS NULL THEN NULL ELSE CAST(vintage AS INTEGER) END as vintage,
+                terminated
             FROM dictionary.raw_member
             WHERE member_id IS NOT NULL
         """, conn)
@@ -104,20 +111,7 @@ def build_dimension_registry():
             FROM dictionary.raw_dimension
         """, conn)
         
-        logger.info(f"Loaded {len(raw_member)} raw members and {len(raw_dim)} raw dimensions")
-        
-        # Data validation
-        if raw_member['member_id'].isna().any():
-            logger.warning("Found NULL member_ids, filtering them out")
-            raw_member = raw_member[raw_member['member_id'].notna()]
-        
-        # Convert member_id to int, handling any float values
-        raw_member['member_id'] = raw_member['member_id'].astype('int64')
-        raw_member['parent_member_id'] = raw_member['parent_member_id'].fillna(0).astype('int64')
-        raw_member.loc[raw_member['parent_member_id'] == 0, 'parent_member_id'] = None
-        
-        logger.info(f"Max member_id: {raw_member['member_id'].max()}")
-        logger.info(f"Min member_id: {raw_member['member_id'].min()}")
+        logger.info(f"Loaded {len(raw_member):,} raw members and {len(raw_dim):,} raw dimensions")
         
         # Step 1: Create member hashes
         logger.info("🔑 Creating member hashes...")
@@ -135,7 +129,7 @@ def build_dimension_registry():
         grouped = raw_member.groupby(["productid", "dimension_position"])["member_hash"].apply(list).reset_index()
         grouped["dimension_hash"] = grouped["member_hash"].apply(hash_dimension)
         
-        # Step 3: Join dimension_hash back to raw data
+        # Step 3: Join dimension hashes back
         logger.info("🔗 Joining dimension hashes...")
         raw_member = raw_member.merge(
             grouped[["productid", "dimension_position", "dimension_hash"]],
@@ -149,7 +143,7 @@ def build_dimension_registry():
             how="left"
         )
         
-        # Step 4: Get canonical labels (most common)
+        # Step 4: Get canonical member information (most common labels)
         logger.info("📝 Selecting canonical member labels...")
         member_canonical = (
             raw_member.groupby(["dimension_hash", "member_id"])
@@ -168,6 +162,7 @@ def build_dimension_registry():
             .reset_index()
         )
         
+        # Add computed fields
         member_canonical["is_total"] = member_canonical["member_name_en"].str.contains(
             "total", case=False, na=False
         )
@@ -184,7 +179,8 @@ def build_dimension_registry():
             .reset_index()
         )
         
-        # Calculate dimension flags
+        # Step 6: Calculate dimension flags
+        logger.info("🏷️ Computing dimension flags...")
         dim_flags = member_canonical.groupby("dimension_hash").agg({
             'is_total': 'any',
             'parent_member_id': lambda x: x.notna().any()
@@ -202,92 +198,82 @@ def build_dimension_registry():
             lambda x: slugify(x, separator="_") if pd.notna(x) else None
         )
         
-        # Step 6: Insert dimension sets
+        # Step 7: Insert dimension sets
         logger.info("💾 Inserting dimension sets...")
+        dim_values = []
         for _, row in dim_canonical.iterrows():
-            try:
-                cur.execute("""
-                    INSERT INTO dictionary.dimension_set (
-                        dimension_hash, dimension_name_en, dimension_name_fr, 
-                        dimension_name_slug, has_total, is_exclusive, 
-                        is_grabbag, is_tree, is_statistics
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    row["dimension_hash"],
-                    row["dimension_name_en"],
-                    row["dimension_name_fr"],
-                    row["dimension_name_slug"],
-                    bool(row["has_total"]),
-                    bool(row["is_exclusive"]),
-                    bool(row["is_grabbag"]),
-                    bool(row["is_tree"]),
-                    bool(row["is_statistics"])
-                ))
-            except Exception as e:
-                logger.error(f"Error inserting dimension set: {e}")
-                logger.error(f"Row data: {row.to_dict()}")
-                raise
+            dim_values.append((
+                row["dimension_hash"],
+                row["dimension_name_en"],
+                row["dimension_name_fr"],
+                row["dimension_name_slug"],
+                bool(row["has_total"]),
+                bool(row["is_exclusive"]),
+                bool(row["is_grabbag"]),
+                bool(row["is_tree"]),
+                bool(row["is_statistics"])
+            ))
         
-        logger.info(f"Inserted {len(dim_canonical)} dimension sets")
+        cur.executemany("""
+            INSERT INTO dictionary.dimension_set (
+                dimension_hash, dimension_name_en, dimension_name_fr, 
+                dimension_name_slug, has_total, is_exclusive, 
+                is_grabbag, is_tree, is_statistics
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, dim_values)
         
-        # Step 7: Insert dimension set members
+        logger.info(f"✅ Inserted {len(dim_values):,} dimension sets")
+        
+        # Step 8: Insert dimension set members
         logger.info("💾 Inserting dimension set members...")
-        error_count = 0
-        success_count = 0
+        member_values = []
+        for _, row in member_canonical.iterrows():
+            # Since we already cast to INTEGER in SQL, these should be clean
+            # But let's ensure Python sees them as int/None
+            member_id = int(row["member_id"]) if pd.notna(row["member_id"]) else None
+            parent_id = int(row["parent_member_id"]) if pd.notna(row["parent_member_id"]) else None
+            geo_level = int(row["geo_level"]) if pd.notna(row["geo_level"]) else None
+            vintage = int(row["vintage"]) if pd.notna(row["vintage"]) else None
+            terminated = bool(row["terminated"]) if pd.notna(row["terminated"]) else None
+            
+            member_values.append((
+                row["dimension_hash"],
+                row["member_hash"],
+                member_id,
+                row["classification_code"],
+                row["classification_type_code"],
+                row["member_name_en"],
+                row["member_name_fr"],
+                row["member_uom_code"],
+                parent_id,
+                geo_level,
+                vintage,
+                terminated,
+                bool(row["is_total"]),
+                None,  # base_name - will be set by script 11
+                row["member_label_norm"]
+            ))
         
-        for idx, row in member_canonical.iterrows():
-            try:
-                # Ensure proper data types
-                member_id = int(row["member_id"])
-                parent_id = int(row["parent_member_id"]) if pd.notna(row["parent_member_id"]) else None
-                geo_level = int(row["geo_level"]) if pd.notna(row["geo_level"]) else None
-                vintage = int(row["vintage"]) if pd.notna(row["vintage"]) else None
-                terminated = bool(row["terminated"]) if pd.notna(row["terminated"]) else None
-                
-                cur.execute("""
-                    INSERT INTO dictionary.dimension_set_member (
-                        dimension_hash, member_hash, member_id,
-                        classification_code, classification_type_code,
-                        member_name_en, member_name_fr, member_uom_code,
-                        parent_member_id, geo_level, vintage, terminated,
-                        is_total, base_name, member_label_norm
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    row["dimension_hash"],
-                    row["member_hash"],
-                    member_id,
-                    row["classification_code"],
-                    row["classification_type_code"],
-                    row["member_name_en"],
-                    row["member_name_fr"],
-                    row["member_uom_code"],
-                    parent_id,
-                    geo_level,
-                    vintage,
-                    terminated,
-                    bool(row["is_total"]),
-                    None,  # base_name will be set by script 11
-                    row["member_label_norm"]
-                ))
-                success_count += 1
-                
-                if success_count % 10000 == 0:
-                    logger.info(f"  Progress: {success_count} members inserted...")
-                    conn.commit()  # Commit periodically
-                    
-            except Exception as e:
-                error_count += 1
-                if error_count <= 5:  # Log first 5 errors
-                    logger.error(f"Error inserting member at index {idx}: {e}")
-                    logger.error(f"member_id: {row['member_id']}, type: {type(row['member_id'])}")
-                    logger.error(f"dimension_hash: {row['dimension_hash']}")
-                if error_count == 100:
-                    logger.error("Too many errors, aborting...")
-                    raise
+        # Insert in batches for better performance
+        batch_size = 10000
+        for i in range(0, len(member_values), batch_size):
+            batch = member_values[i:i+batch_size]
+            cur.executemany("""
+                INSERT INTO dictionary.dimension_set_member (
+                    dimension_hash, member_hash, member_id,
+                    classification_code, classification_type_code,
+                    member_name_en, member_name_fr, member_uom_code,
+                    parent_member_id, geo_level, vintage, terminated,
+                    is_total, base_name, member_label_norm
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, batch)
+            
+            if (i + batch_size) % 50000 == 0:
+                logger.info(f"  Progress: {min(i+batch_size, len(member_values)):,}/{len(member_values):,} members")
         
-        logger.info(f"Inserted {success_count} dimension set members ({error_count} errors)")
+        logger.info(f"✅ Inserted {len(member_values):,} dimension set members")
         
-        # Step 8: Insert cube dimension map
+        # Step 9: Insert cube dimension map
         logger.info("🗺️ Inserting cube dimension map...")
         cube_dim_map = raw_dim[["productid", "dimension_position", "dimension_hash", 
                                 "dimension_name_en", "dimension_name_fr"]].drop_duplicates()
@@ -295,13 +281,9 @@ def build_dimension_registry():
             lambda x: slugify(x, separator="_") if pd.notna(x) else None
         )
         
+        map_values = []
         for _, row in cube_dim_map.iterrows():
-            cur.execute("""
-                INSERT INTO cube.cube_dimension_map (
-                    productid, dimension_position, dimension_hash,
-                    dimension_name_en, dimension_name_fr, dimension_name_slug
-                ) VALUES (%s, %s, %s, %s, %s, %s)
-            """, (
+            map_values.append((
                 int(row["productid"]),
                 int(row["dimension_position"]),
                 row["dimension_hash"],
@@ -310,9 +292,16 @@ def build_dimension_registry():
                 row["dimension_name_slug"]
             ))
         
-        logger.info(f"Inserted {len(cube_dim_map)} cube dimension mappings")
+        cur.executemany("""
+            INSERT INTO cube.cube_dimension_map (
+                productid, dimension_position, dimension_hash,
+                dimension_name_en, dimension_name_fr, dimension_name_slug
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+        """, map_values)
         
-        # Final commit
+        logger.info(f"✅ Inserted {len(map_values):,} cube dimension mappings")
+        
+        # Commit all changes
         conn.commit()
         
         # Summary statistics
@@ -324,11 +313,12 @@ def build_dimension_registry():
         map_count = cur.fetchone()[0]
         
         logger.info(f"""
-        ✅ Dimension registry build completed!
+        ✅ Dimension registry build completed successfully!
+        
         📊 Summary:
-        - Unique dimension sets: {dim_count}
-        - Total dimension members: {member_count}
-        - Cube dimension mappings: {map_count}
+        - Unique dimension sets: {dim_count:,}
+        - Total dimension members: {member_count:,}
+        - Cube dimension mappings: {map_count:,}
         """)
 
 if __name__ == "__main__":
