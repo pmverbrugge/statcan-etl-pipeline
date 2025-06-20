@@ -48,6 +48,43 @@ pg_dump: saving encoding = UTF8
 pg_dump: saving standard_conforming_strings = on
 pg_dump: saving search_path = 
 pg_dump: saving database definition
+pg_dump: dropping DATABASE statcan
+pg_dump: creating DATABASE "statcan"
+pg_dump: connecting to new database "statcan"
+pg_dump: creating SCHEMA "cube"
+pg_dump: creating SCHEMA "cube_data"
+pg_dump: creating SCHEMA "dictionary"
+pg_dump: creating SCHEMA "processing"
+pg_dump: creating SCHEMA "raw_files"
+pg_dump: creating SCHEMA "spine"
+pg_dump: creating EXTENSION "pgcrypto"
+pg_dump: creating COMMENT "EXTENSION pgcrypto"
+pg_dump: creating EXTENSION "postgis"
+pg_dump: creating COMMENT "EXTENSION postgis"
+pg_dump: creating EXTENSION "uuid-ossp"
+pg_dump: creating COMMENT "EXTENSION "uuid-ossp""
+pg_dump: creating TABLE "cube_data.13100653"
+pg_dump: creating TABLE "cube_data.c10100001"
+pg_dump: creating TABLE "cube_data.c10100002"
+pg_dump: creating TABLE "cube_data.c10100003"
+pg_dump: creating TABLE "cube_data.c10100004"
+pg_dump: creating TABLE "cube_data.c10100005"
+pg_dump: creating TABLE "dictionary.dimension_set"
+pg_dump: creating COMMENT "dictionary.TABLE dimension_set"
+pg_dump: creating COMMENT "dictionary.COLUMN dimension_set.dimension_hash"
+pg_dump: creating COMMENT "dictionary.COLUMN dimension_set.is_tree"
+pg_dump: creating TABLE "dictionary.dimension_set_member"
+pg_dump: creating TABLE "processing.dimension_set"
+pg_dump: creating COMMENT "processing.TABLE dimension_set"
+pg_dump: creating COMMENT "processing.COLUMN dimension_set.dimension_hash"
+pg_dump: creating COMMENT "processing.COLUMN dimension_set.dimension_name_en"
+pg_dump: creating COMMENT "processing.COLUMN dimension_set.dimension_name_fr"
+pg_dump: creating COMMENT "processing.COLUMN dimension_set.has_uom"
+pg_dump: creating COMMENT "processing.COLUMN dimension_set.usage_count"
+pg_dump: creating COMMENT "processing.COLUMN dimension_set.is_tree"
+pg_dump: creating COMMENT "processing.COLUMN dimension_set.is_hetero"
+pg_dump: creating TABLE "processing.dimension_set_members"
+pg_dump: creating COMMENT "processing.TABLE dimension_set_members"
 --
 -- PostgreSQL database dump
 --
@@ -55,7 +92,7 @@ pg_dump: saving database definition
 -- Dumped from database version 15.8 (Debian 15.8-1.pgdg110+1)
 -- Dumped by pg_dump version 15.8 (Debian 15.8-1.pgdg110+1)
 
--- Started on 2025-06-20 14:32:30 UTC
+-- Started on 2025-06-20 15:08:44 UTC
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -461,46 +498,6 @@ COMMENT ON COLUMN processing.dimension_set.is_tree IS 'True if any members in th
 COMMENT ON COLUMN processing.dimension_set.is_hetero IS 'True if members in this dimension have varying units of measure (heterogeneous UOM)';
 
 
-pg_dump: dropping DATABASE statcan
-pg_dump: creating DATABASE "statcan"
-pg_dump: connecting to new database "statcan"
-pg_dump: creating SCHEMA "cube"
-pg_dump: creating SCHEMA "cube_data"
-pg_dump: creating SCHEMA "dictionary"
-pg_dump: creating SCHEMA "processing"
-pg_dump: creating SCHEMA "raw_files"
-pg_dump: creating SCHEMA "spine"
-pg_dump: creating EXTENSION "pgcrypto"
-pg_dump: creating COMMENT "EXTENSION pgcrypto"
-pg_dump: creating EXTENSION "postgis"
-pg_dump: creating COMMENT "EXTENSION postgis"
-pg_dump: creating EXTENSION "uuid-ossp"
-pg_dump: creating COMMENT "EXTENSION "uuid-ossp""
-pg_dump: creating TABLE "cube_data.13100653"
-pg_dump: creating TABLE "cube_data.c10100001"
-pg_dump: creating TABLE "cube_data.c10100002"
-pg_dump: creating TABLE "cube_data.c10100003"
-pg_dump: creating TABLE "cube_data.c10100004"
-pg_dump: creating TABLE "cube_data.c10100005"
-pg_dump: creating TABLE "dictionary.dimension_set"
-pg_dump: creating COMMENT "dictionary.TABLE dimension_set"
-pg_dump: creating COMMENT "dictionary.COLUMN dimension_set.dimension_hash"
-pg_dump: creating COMMENT "dictionary.COLUMN dimension_set.is_tree"
-pg_dump: creating TABLE "dictionary.dimension_set_member"
-pg_dump: creating TABLE "processing.dimension_set"
-pg_dump: creating COMMENT "processing.TABLE dimension_set"
-pg_dump: creating COMMENT "processing.COLUMN dimension_set.dimension_hash"
-pg_dump: creating COMMENT "processing.COLUMN dimension_set.dimension_name_en"
-pg_dump: creating COMMENT "processing.COLUMN dimension_set.dimension_name_fr"
-pg_dump: creating COMMENT "processing.COLUMN dimension_set.has_uom"
-pg_dump: creating COMMENT "processing.COLUMN dimension_set.usage_count"
-pg_dump: creating COMMENT "processing.COLUMN dimension_set.is_tree"
-pg_dump: creating COMMENT "processing.COLUMN dimension_set.is_hetero"
-pg_dump: creating TABLE "processing.dimension_set_members"
-pg_dump: creating COMMENT "processing.TABLE dimension_set_members"
-pg_dump: creating COMMENT "processing.COLUMN dimension_set_members.dimension_hash"
-pg_dump: creating COMMENT "processing.COLUMN dimension_set_members.member_name_en"
-pg_dump: creating COMMENT "processing.COLUMN dimension_set_members.member_name_fr"
 --
 -- TOC entry 251 (class 1259 OID 27335)
 -- Name: dimension_set_members; Type: TABLE; Schema: processing; Owner: -
@@ -564,8 +561,10 @@ COMMENT ON COLUMN processing.dimension_set_members.member_name_fr IS 'Most commo
 COMMENT ON COLUMN processing.dimension_set_members.usage_count IS 'Number of cube instances where this member appears in this dimension';
 
 
+pg_dump: creating COMMENT "processing.COLUMN dimension_set_members.dimension_hash"
+pg_dump: creating COMMENT "processing.COLUMN dimension_set_members.member_name_en"
+pg_dump: creating COMMENT "processing.COLUMN dimension_set_members.member_name_fr"
 pg_dump: creating COMMENT "processing.COLUMN dimension_set_members.usage_count"
-pg_dump: creating COMMENT "processing.COLUMN dimension_set_members.tree_level"
 --
 -- TOC entry 4509 (class 0 OID 0)
 -- Dependencies: 251
@@ -575,9 +574,9 @@ pg_dump: creating COMMENT "processing.COLUMN dimension_set_members.tree_level"
 COMMENT ON COLUMN processing.dimension_set_members.tree_level IS 'Hierarchical level: 1 for root nodes (no parent), 2 for children of root nodes, etc. NULL for non-hierarchical dimensions.';
 
 
+pg_dump: creating COMMENT "processing.COLUMN dimension_set_members.tree_level"
 pg_dump: creating TABLE "processing.processed_dimensions"
 pg_dump: creating COMMENT "processing.TABLE processed_dimensions"
-pg_dump: creating COMMENT "processing.COLUMN processed_dimensions.dimension_hash"
 --
 -- TOC entry 249 (class 1259 OID 27224)
 -- Name: processed_dimensions; Type: TABLE; Schema: processing; Owner: -
@@ -621,6 +620,11 @@ COMMENT ON COLUMN processing.processed_dimensions.dimension_hash IS '12-characte
 COMMENT ON COLUMN processing.processed_dimensions.has_uom IS 'Indicates if this dimension contains unit of measure information';
 
 
+pg_dump: creating COMMENT "processing.COLUMN processed_dimensions.dimension_hash"
+pg_dump: creating COMMENT "processing.COLUMN processed_dimensions.has_uom"
+pg_dump: creating TABLE "processing.processed_members"
+pg_dump: creating COMMENT "processing.TABLE processed_members"
+pg_dump: creating COMMENT "processing.COLUMN processed_members.member_hash"
 --
 -- TOC entry 248 (class 1259 OID 27132)
 -- Name: processed_members; Type: TABLE; Schema: processing; Owner: -
@@ -646,13 +650,6 @@ CREATE TABLE processing.processed_members (
 );
 
 
-pg_dump: creating COMMENT "processing.COLUMN processed_dimensions.has_uom"
-pg_dump: creating TABLE "processing.processed_members"
-pg_dump: creating COMMENT "processing.TABLE processed_members"
-pg_dump: creating COMMENT "processing.COLUMN processed_members.member_hash"
-pg_dump: creating COMMENT "processing.COLUMN processed_members.member_label_norm"
-pg_dump: creating COMMENT "processing.COLUMN processed_members.dimension_hash"
-pg_dump: creating TABLE "processing.raw_dimension"
 --
 -- TOC entry 4513 (class 0 OID 0)
 -- Dependencies: 248
@@ -662,6 +659,9 @@ pg_dump: creating TABLE "processing.raw_dimension"
 COMMENT ON TABLE processing.processed_members IS 'Raw member data with computed member-level hashes. Input for dimension registry building (script 11+).';
 
 
+pg_dump: creating COMMENT "processing.COLUMN processed_members.member_label_norm"
+pg_dump: creating COMMENT "processing.COLUMN processed_members.dimension_hash"
+pg_dump: creating TABLE "processing.raw_dimension"
 --
 -- TOC entry 4514 (class 0 OID 0)
 -- Dependencies: 248
@@ -704,9 +704,6 @@ CREATE TABLE processing.raw_dimension (
 );
 
 
-pg_dump: creating COMMENT "processing.TABLE raw_dimension"
-pg_dump: creating COMMENT "processing.COLUMN raw_dimension.created_at"
-pg_dump: creating TABLE "processing.raw_member"
 --
 -- TOC entry 4517 (class 0 OID 0)
 -- Dependencies: 252
@@ -725,6 +722,12 @@ COMMENT ON TABLE processing.raw_dimension IS 'Raw dimension metadata from Statis
 COMMENT ON COLUMN processing.raw_dimension.created_at IS 'Timestamp when record was created';
 
 
+pg_dump: creating COMMENT "processing.TABLE raw_dimension"
+pg_dump: creating COMMENT "processing.COLUMN raw_dimension.created_at"
+pg_dump: creating TABLE "processing.raw_member"
+pg_dump: creating COMMENT "processing.TABLE raw_member"
+pg_dump: creating COMMENT "processing.COLUMN raw_member.created_at"
+pg_dump: creating TABLE "raw_files.changed_cubes_log"
 --
 -- TOC entry 253 (class 1259 OID 27373)
 -- Name: raw_member; Type: TABLE; Schema: processing; Owner: -
@@ -747,8 +750,6 @@ CREATE TABLE processing.raw_member (
 );
 
 
-pg_dump: creating COMMENT "processing.TABLE raw_member"
-pg_dump: creating COMMENT "processing.COLUMN raw_member.created_at"
 --
 -- TOC entry 4519 (class 0 OID 0)
 -- Dependencies: 253
@@ -791,6 +792,10 @@ CREATE TABLE raw_files.cube_status (
 );
 
 
+pg_dump: creating TABLE "raw_files.cube_status"
+pg_dump: creating TABLE "raw_files.manage_cube_raw_files"
+pg_dump: creating SEQUENCE "raw_files.manage_cube_raw_files_id_seq"
+pg_dump: creating SEQUENCE OWNED BY "raw_files.manage_cube_raw_files_id_seq"
 --
 -- TOC entry 232 (class 1259 OID 25732)
 -- Name: manage_cube_raw_files; Type: TABLE; Schema: raw_files; Owner: -
@@ -820,6 +825,7 @@ CREATE SEQUENCE raw_files.manage_cube_raw_files_id_seq
     CACHE 1;
 
 
+pg_dump: creating TABLE "raw_files.manage_metadata_raw_files"
 --
 -- TOC entry 4521 (class 0 OID 0)
 -- Dependencies: 231
@@ -829,13 +835,6 @@ CREATE SEQUENCE raw_files.manage_cube_raw_files_id_seq
 ALTER SEQUENCE raw_files.manage_cube_raw_files_id_seq OWNED BY raw_files.manage_cube_raw_files.id;
 
 
-pg_dump: creating TABLE "raw_files.changed_cubes_log"
-pg_dump: creating TABLE "raw_files.cube_status"
-pg_dump: creating TABLE "raw_files.manage_cube_raw_files"
-pg_dump: creating SEQUENCE "raw_files.manage_cube_raw_files_id_seq"
-pg_dump: creating SEQUENCE OWNED BY "raw_files.manage_cube_raw_files_id_seq"
-pg_dump: creating TABLE "raw_files.manage_metadata_raw_files"
-pg_dump: creating SEQUENCE "raw_files.manage_metadata_raw_files_id_seq"
 --
 -- TOC entry 239 (class 1259 OID 26011)
 -- Name: manage_metadata_raw_files; Type: TABLE; Schema: raw_files; Owner: -
@@ -851,6 +850,7 @@ CREATE TABLE raw_files.manage_metadata_raw_files (
 );
 
 
+pg_dump: creating SEQUENCE "raw_files.manage_metadata_raw_files_id_seq"
 --
 -- TOC entry 238 (class 1259 OID 26010)
 -- Name: manage_metadata_raw_files_id_seq; Type: SEQUENCE; Schema: raw_files; Owner: -
@@ -894,6 +894,9 @@ pg_dump: creating SEQUENCE "raw_files.manage_spine_raw_files_id_seq"
 pg_dump: creating SEQUENCE OWNED BY "raw_files.manage_spine_raw_files_id_seq"
 pg_dump: creating TABLE "raw_files.metadata_status"
 pg_dump: creating TABLE "spine.cube"
+pg_dump: creating TABLE "spine.cube_subject"
+pg_dump: creating TABLE "spine.cube_survey"
+pg_dump: creating DEFAULT "raw_files.manage_cube_raw_files id"
 --
 -- TOC entry 233 (class 1259 OID 25744)
 -- Name: manage_spine_raw_files_id_seq; Type: SEQUENCE; Schema: raw_files; Owner: -
@@ -949,8 +952,6 @@ CREATE TABLE spine.cube (
 );
 
 
-pg_dump: creating TABLE "spine.cube_subject"
-pg_dump: creating TABLE "spine.cube_survey"
 --
 -- TOC entry 229 (class 1259 OID 17625)
 -- Name: cube_subject; Type: TABLE; Schema: spine; Owner: -
@@ -973,8 +974,6 @@ CREATE TABLE spine.cube_survey (
 );
 
 
-pg_dump: creating DEFAULT "raw_files.manage_cube_raw_files id"
-pg_dump: creating DEFAULT "raw_files.manage_metadata_raw_files id"
 --
 -- TOC entry 4245 (class 2604 OID 25735)
 -- Name: manage_cube_raw_files id; Type: DEFAULT; Schema: raw_files; Owner: -
@@ -983,6 +982,8 @@ pg_dump: creating DEFAULT "raw_files.manage_metadata_raw_files id"
 ALTER TABLE ONLY raw_files.manage_cube_raw_files ALTER COLUMN id SET DEFAULT nextval('raw_files.manage_cube_raw_files_id_seq'::regclass);
 
 
+pg_dump: creating DEFAULT "raw_files.manage_metadata_raw_files id"
+pg_dump: creating DEFAULT "raw_files.manage_spine_raw_files id"
 --
 -- TOC entry 4253 (class 2604 OID 26014)
 -- Name: manage_metadata_raw_files id; Type: DEFAULT; Schema: raw_files; Owner: -
@@ -991,8 +992,6 @@ ALTER TABLE ONLY raw_files.manage_cube_raw_files ALTER COLUMN id SET DEFAULT nex
 ALTER TABLE ONLY raw_files.manage_metadata_raw_files ALTER COLUMN id SET DEFAULT nextval('raw_files.manage_metadata_raw_files_id_seq'::regclass);
 
 
-pg_dump: creating DEFAULT "raw_files.manage_spine_raw_files id"
-pg_dump: creating CONSTRAINT "cube_data.c10100001 c10100001_pkey"
 --
 -- TOC entry 4248 (class 2604 OID 25748)
 -- Name: manage_spine_raw_files id; Type: DEFAULT; Schema: raw_files; Owner: -
@@ -1001,6 +1000,7 @@ pg_dump: creating CONSTRAINT "cube_data.c10100001 c10100001_pkey"
 ALTER TABLE ONLY raw_files.manage_spine_raw_files ALTER COLUMN id SET DEFAULT nextval('raw_files.manage_spine_raw_files_id_seq'::regclass);
 
 
+pg_dump: creating CONSTRAINT "cube_data.c10100001 c10100001_pkey"
 --
 -- TOC entry 4297 (class 2606 OID 26674)
 -- Name: c10100001 c10100001_pkey; Type: CONSTRAINT; Schema: cube_data; Owner: -
@@ -1011,7 +1011,6 @@ ALTER TABLE ONLY cube_data.c10100001
 
 
 pg_dump: creating CONSTRAINT "cube_data.c10100002 c10100002_pkey"
-pg_dump: creating CONSTRAINT "cube_data.c10100003 c10100003_pkey"
 --
 -- TOC entry 4301 (class 2606 OID 26683)
 -- Name: c10100002 c10100002_pkey; Type: CONSTRAINT; Schema: cube_data; Owner: -
@@ -1021,6 +1020,8 @@ ALTER TABLE ONLY cube_data.c10100002
     ADD CONSTRAINT c10100002_pkey PRIMARY KEY (ref_date, geography_member_id, central_government_debt_member_id);
 
 
+pg_dump: creating CONSTRAINT "cube_data.c10100003 c10100003_pkey"
+pg_dump: creating CONSTRAINT "cube_data.c10100004 c10100004_pkey"
 --
 -- TOC entry 4305 (class 2606 OID 26692)
 -- Name: c10100003 c10100003_pkey; Type: CONSTRAINT; Schema: cube_data; Owner: -
@@ -1030,8 +1031,6 @@ ALTER TABLE ONLY cube_data.c10100003
     ADD CONSTRAINT c10100003_pkey PRIMARY KEY (ref_date, geography_member_id, type_of_issues_member_id, issuers_member_id);
 
 
-pg_dump: creating CONSTRAINT "cube_data.c10100004 c10100004_pkey"
-pg_dump: creating CONSTRAINT "cube_data.c10100005 c10100005_pkey"
 --
 -- TOC entry 4309 (class 2606 OID 26707)
 -- Name: c10100004 c10100004_pkey; Type: CONSTRAINT; Schema: cube_data; Owner: -
@@ -1041,6 +1040,10 @@ ALTER TABLE ONLY cube_data.c10100004
     ADD CONSTRAINT c10100004_pkey PRIMARY KEY (ref_date, geography_member_id, claims_and_deposits_member_id, type_of_non_resident_member_id, country_of_non_resident_member_id);
 
 
+pg_dump: creating CONSTRAINT "cube_data.c10100005 c10100005_pkey"
+pg_dump: creating CONSTRAINT "dictionary.dimension_set_member dimension_set_member_unique"
+pg_dump: creating CONSTRAINT "dictionary.dimension_set dimension_set_pkey"
+pg_dump: creating CONSTRAINT "processing.dimension_set_members dimension_set_members_pkey"
 --
 -- TOC entry 4313 (class 2606 OID 26722)
 -- Name: c10100005 c10100005_pkey; Type: CONSTRAINT; Schema: cube_data; Owner: -
@@ -1050,10 +1053,7 @@ ALTER TABLE ONLY cube_data.c10100005
     ADD CONSTRAINT c10100005_pkey PRIMARY KEY (ref_date, geography_member_id, public_sector_components_member_id, canadian_classification_of_functions_of_government_ccofog_membe);
 
 
-pg_dump: creating CONSTRAINT "dictionary.dimension_set_member dimension_set_member_unique"
-pg_dump: creating CONSTRAINT "dictionary.dimension_set dimension_set_pkey"
-pg_dump: creating CONSTRAINT "processing.dimension_set_members dimension_set_members_pkey"
-pg_dump: --
+--
 -- TOC entry 4295 (class 2606 OID 26321)
 -- Name: dimension_set_member dimension_set_member_unique; Type: CONSTRAINT; Schema: dictionary; Owner: -
 --
@@ -1089,8 +1089,6 @@ ALTER TABLE ONLY processing.dimension_set
     ADD CONSTRAINT dimension_set_pkey PRIMARY KEY (dimension_hash);
 
 
-creating CONSTRAINT "processing.dimension_set dimension_set_pkey"
-pg_dump: creating CONSTRAINT "processing.processed_dimensions processed_dimensions_pkey"
 --
 -- TOC entry 4323 (class 2606 OID 27231)
 -- Name: processed_dimensions processed_dimensions_pkey; Type: CONSTRAINT; Schema: processing; Owner: -
@@ -1100,6 +1098,8 @@ ALTER TABLE ONLY processing.processed_dimensions
     ADD CONSTRAINT processed_dimensions_pkey PRIMARY KEY (productid, dimension_position);
 
 
+pg_dump: creating CONSTRAINT "processing.dimension_set dimension_set_pkey"
+pg_dump: creating CONSTRAINT "processing.processed_dimensions processed_dimensions_pkey"
 pg_dump: creating CONSTRAINT "processing.processed_members processed_members_pkey"
 --
 -- TOC entry 4320 (class 2606 OID 27139)
@@ -1119,11 +1119,6 @@ ALTER TABLE ONLY processing.raw_dimension
     ADD CONSTRAINT processing_raw_dimension_pkey PRIMARY KEY (productid, dimension_position);
 
 
-pg_dump: creating CONSTRAINT "processing.raw_dimension processing_raw_dimension_pkey"
-pg_dump: creating CONSTRAINT "processing.raw_member processing_raw_member_pkey"
-pg_dump: creating CONSTRAINT "raw_files.changed_cubes_log changed_cubes_log_pkey"
-pg_dump: creating CONSTRAINT "raw_files.cube_status cube_status_pkey"
-pg_dump: creating CONSTRAINT "raw_files.manage_cube_raw_files manage_cube_raw_files_pkey"
 --
 -- TOC entry 4335 (class 2606 OID 27380)
 -- Name: raw_member processing_raw_member_pkey; Type: CONSTRAINT; Schema: processing; Owner: -
@@ -1169,6 +1164,15 @@ ALTER TABLE ONLY raw_files.manage_metadata_raw_files
     ADD CONSTRAINT manage_metadata_raw_files_pkey PRIMARY KEY (id);
 
 
+pg_dump: creating CONSTRAINT "processing.raw_dimension processing_raw_dimension_pkey"
+pg_dump: creating CONSTRAINT "processing.raw_member processing_raw_member_pkey"
+pg_dump: creating CONSTRAINT "raw_files.changed_cubes_log changed_cubes_log_pkey"
+pg_dump: creating CONSTRAINT "raw_files.cube_status cube_status_pkey"
+pg_dump: creating CONSTRAINT "raw_files.manage_cube_raw_files manage_cube_raw_files_pkey"
+pg_dump: creating CONSTRAINT "raw_files.manage_metadata_raw_files manage_metadata_raw_files_pkey"
+pg_dump: creating CONSTRAINT "raw_files.manage_spine_raw_files manage_spine_raw_files_pkey"
+pg_dump: creating CONSTRAINT "raw_files.metadata_status metadata_status_pkey"
+pg_dump: creating CONSTRAINT "spine.cube cube_pkey"
 --
 -- TOC entry 4283 (class 2606 OID 25754)
 -- Name: manage_spine_raw_files manage_spine_raw_files_pkey; Type: CONSTRAINT; Schema: raw_files; Owner: -
@@ -1178,12 +1182,6 @@ ALTER TABLE ONLY raw_files.manage_spine_raw_files
     ADD CONSTRAINT manage_spine_raw_files_pkey PRIMARY KEY (id);
 
 
-pg_dump: creating CONSTRAINT "raw_files.manage_metadata_raw_files manage_metadata_raw_files_pkey"
-pg_dump: creating CONSTRAINT "raw_files.manage_spine_raw_files manage_spine_raw_files_pkey"
-pg_dump: creating CONSTRAINT "raw_files.metadata_status metadata_status_pkey"
-pg_dump: creating CONSTRAINT "spine.cube cube_pkey"
-pg_dump: creating CONSTRAINT "spine.cube_subject cube_subject_pkey"
-pg_dump: creating CONSTRAINT "spine.cube_survey cube_survey_pkey"
 --
 -- TOC entry 4289 (class 2606 OID 26002)
 -- Name: metadata_status metadata_status_pkey; Type: CONSTRAINT; Schema: raw_files; Owner: -
@@ -1193,6 +1191,8 @@ ALTER TABLE ONLY raw_files.metadata_status
     ADD CONSTRAINT metadata_status_pkey PRIMARY KEY (productid);
 
 
+pg_dump: creating CONSTRAINT "spine.cube_subject cube_subject_pkey"
+pg_dump: creating CONSTRAINT "spine.cube_survey cube_survey_pkey"
 --
 -- TOC entry 4272 (class 2606 OID 17617)
 -- Name: cube cube_pkey; Type: CONSTRAINT; Schema: spine; Owner: -
@@ -1220,8 +1220,6 @@ ALTER TABLE ONLY spine.cube_survey
     ADD CONSTRAINT cube_survey_pkey PRIMARY KEY (productid, surveycode);
 
 
-pg_dump: creating INDEX "cube_data.c10100001_ref_date_idx"
-pg_dump: creating INDEX "cube_data.c10100001_value_idx"
 --
 -- TOC entry 4298 (class 1259 OID 26675)
 -- Name: c10100001_ref_date_idx; Type: INDEX; Schema: cube_data; Owner: -
@@ -1238,6 +1236,12 @@ CREATE INDEX c10100001_ref_date_idx ON cube_data.c10100001 USING btree (ref_date
 CREATE INDEX c10100001_value_idx ON cube_data.c10100001 USING btree (value) WHERE (value IS NOT NULL);
 
 
+pg_dump: creating INDEX "cube_data.c10100001_ref_date_idx"
+pg_dump: creating INDEX "cube_data.c10100001_value_idx"
+pg_dump: creating INDEX "cube_data.c10100002_ref_date_idx"
+pg_dump: creating INDEX "cube_data.c10100002_value_idx"
+pg_dump: creating INDEX "cube_data.c10100003_ref_date_idx"
+pg_dump: creating INDEX "cube_data.c10100003_value_idx"
 --
 -- TOC entry 4302 (class 1259 OID 26684)
 -- Name: c10100002_ref_date_idx; Type: INDEX; Schema: cube_data; Owner: -
@@ -1262,11 +1266,8 @@ CREATE INDEX c10100002_value_idx ON cube_data.c10100002 USING btree (value) WHER
 CREATE INDEX c10100003_ref_date_idx ON cube_data.c10100003 USING btree (ref_date);
 
 
-pg_dump: creating INDEX "cube_data.c10100002_ref_date_idx"
-pg_dump: creating INDEX "cube_data.c10100002_value_idx"
-pg_dump: creating INDEX "cube_data.c10100003_ref_date_idx"
-pg_dump: creating INDEX "cube_data.c10100003_value_idx"
 pg_dump: creating INDEX "cube_data.c10100004_ref_date_idx"
+pg_dump: creating INDEX "cube_data.c10100004_value_idx"
 --
 -- TOC entry 4307 (class 1259 OID 26694)
 -- Name: c10100003_value_idx; Type: INDEX; Schema: cube_data; Owner: -
@@ -1291,6 +1292,10 @@ CREATE INDEX c10100004_ref_date_idx ON cube_data.c10100004 USING btree (ref_date
 CREATE INDEX c10100004_value_idx ON cube_data.c10100004 USING btree (value) WHERE (value IS NOT NULL);
 
 
+pg_dump: creating INDEX "cube_data.c10100005_ref_date_idx"
+pg_dump: creating INDEX "cube_data.c10100005_value_idx"
+pg_dump: creating INDEX "processing.idx_dimension_set_members_member_id"
+pg_dump: creating INDEX "processing.idx_processed_dimensions_dimension_hash"
 --
 -- TOC entry 4314 (class 1259 OID 26723)
 -- Name: c10100005_ref_date_idx; Type: INDEX; Schema: cube_data; Owner: -
@@ -1299,14 +1304,6 @@ CREATE INDEX c10100004_value_idx ON cube_data.c10100004 USING btree (value) WHER
 CREATE INDEX c10100005_ref_date_idx ON cube_data.c10100005 USING btree (ref_date);
 
 
-pg_dump: creating INDEX "cube_data.c10100004_value_idx"
-pg_dump: creating INDEX "cube_data.c10100005_ref_date_idx"
-pg_dump: creating INDEX "cube_data.c10100005_value_idx"
-pg_dump: creating INDEX "processing.idx_dimension_set_members_member_id"
-pg_dump: creating INDEX "processing.idx_processed_dimensions_dimension_hash"
-pg_dump: creating INDEX "processing.idx_processed_members_dimension_hash"
-pg_dump: creating INDEX "processing.idx_processed_members_member_hash"
-pg_dump: creating INDEX "processing.idx_processed_members_productid_pos"
 --
 -- TOC entry 4315 (class 1259 OID 26724)
 -- Name: c10100005_value_idx; Type: INDEX; Schema: cube_data; Owner: -
@@ -1339,6 +1336,8 @@ CREATE INDEX idx_processed_dimensions_dimension_hash ON processing.processed_dim
 CREATE INDEX idx_processed_members_dimension_hash ON processing.processed_members USING btree (dimension_hash);
 
 
+pg_dump: creating INDEX "processing.idx_processed_members_dimension_hash"
+pg_dump: creating INDEX "processing.idx_processed_members_member_hash"
 --
 -- TOC entry 4317 (class 1259 OID 27141)
 -- Name: idx_processed_members_member_hash; Type: INDEX; Schema: processing; Owner: -
@@ -1347,8 +1346,6 @@ CREATE INDEX idx_processed_members_dimension_hash ON processing.processed_member
 CREATE INDEX idx_processed_members_member_hash ON processing.processed_members USING btree (member_hash);
 
 
-pg_dump: creating INDEX "processing.idx_processing_raw_dimension_productid"
-pg_dump: creating INDEX "processing.idx_processing_raw_member_classification"
 --
 -- TOC entry 4318 (class 1259 OID 27140)
 -- Name: idx_processed_members_productid_pos; Type: INDEX; Schema: processing; Owner: -
@@ -1357,6 +1354,13 @@ pg_dump: creating INDEX "processing.idx_processing_raw_member_classification"
 CREATE INDEX idx_processed_members_productid_pos ON processing.processed_members USING btree (productid, dimension_position);
 
 
+pg_dump: creating INDEX "processing.idx_processed_members_productid_pos"
+pg_dump: creating INDEX "processing.idx_processing_raw_dimension_productid"
+pg_dump: creating INDEX "processing.idx_processing_raw_member_classification"
+pg_dump: creating INDEX "processing.idx_processing_raw_member_productid"
+pg_dump: creating INDEX "raw_files.manage_cube_raw_files_productid_file_hash_idx"
+pg_dump: creating INDEX "raw_files.manage_cube_raw_files_productid_idx"
+pg_dump: creating INDEX "raw_files.manage_spine_raw_files_file_hash_idx"
 --
 -- TOC entry 4329 (class 1259 OID 27381)
 -- Name: idx_processing_raw_dimension_productid; Type: INDEX; Schema: processing; Owner: -
@@ -1373,8 +1377,7 @@ CREATE INDEX idx_processing_raw_dimension_productid ON processing.raw_dimension 
 CREATE INDEX idx_processing_raw_member_classification ON processing.raw_member USING btree (classification_code);
 
 
-pg_dump: creating INDEX "processing.idx_processing_raw_member_productid"
-pg_dump: --
+--
 -- TOC entry 4333 (class 1259 OID 27382)
 -- Name: idx_processing_raw_member_productid; Type: INDEX; Schema: processing; Owner: -
 --
@@ -1390,9 +1393,6 @@ CREATE INDEX idx_processing_raw_member_productid ON processing.raw_member USING 
 CREATE UNIQUE INDEX manage_cube_raw_files_productid_file_hash_idx ON raw_files.manage_cube_raw_files USING btree (productid, file_hash);
 
 
-creating INDEX "raw_files.manage_cube_raw_files_productid_file_hash_idx"
-pg_dump: creating INDEX "raw_files.manage_cube_raw_files_productid_idx"
-pg_dump: creating INDEX "raw_files.manage_spine_raw_files_file_hash_idx"
 --
 -- TOC entry 4280 (class 1259 OID 25742)
 -- Name: manage_cube_raw_files_productid_idx; Type: INDEX; Schema: raw_files; Owner: -
@@ -1419,7 +1419,7 @@ ALTER TABLE ONLY dictionary.dimension_set_member
     ADD CONSTRAINT dimension_member_dimension_hash_fkey FOREIGN KEY (dimension_hash) REFERENCES dictionary.dimension_set(dimension_hash);
 
 
--- Completed on 2025-06-20 14:32:31 UTC
+-- Completed on 2025-06-20 15:08:44 UTC
 
 --
 -- PostgreSQL database dump complete
