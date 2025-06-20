@@ -4,4 +4,6 @@ duckdb
 psycopg2-binary
 python-dotenv
 loguru
-
+python-slugify
+pandarallel
+nltk

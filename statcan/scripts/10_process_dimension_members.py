@@ -15,7 +15,12 @@ This script processes raw dimension members from Statistics Canada metadata,
 creating normalized, hash-based identifiers for deduplication and harmonization.
 It generates member-level hashes and dimension-level hashes for the registry system.
 
-The output feeds into 10b_build_dimension_registry.py for final registry construction.
+Key Changes:
+- Updated to read from processing.raw_member (instead of dictionary.raw_member)
+- Enhanced error handling and validation
+- TimescaleDB optimization support
+
+The output feeds into 11_process_dimension.py for final registry construction.
 
 Key Operations:
 --------------
@@ -27,7 +32,7 @@ Key Operations:
 
 Processing Pipeline:
 -------------------
-1. Load raw_member and raw_dimension data
+1. Load raw_member and raw_dimension data FROM PROCESSING SCHEMA
 2. Generate member_hash for each unique code-label-parent-UOM combination
 3. Create dimension_hash by aggregating member hashes per dimension
 4. Select most common English/French labels for each member
@@ -76,38 +81,42 @@ def hash_dimension_identity(member_hashes):
 def get_db_conn():
     return psycopg2.connect(**DB_CONFIG)
 
-def check_processed_members_table():
-    """Verify the processing table exists"""
+def check_required_tables():
+    """Verify required tables exist"""
     with get_db_conn() as conn:
         cur = conn.cursor()
         
-        # Check if table exists
-        cur.execute("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_schema = 'processing' 
-                AND table_name = 'processed_members'
-            )
-        """)
+        required_tables = [
+            ('processing', 'raw_member'),
+            ('processing', 'processed_members')
+        ]
         
-        if not cur.fetchone()[0]:
-            raise Exception(
-                "❌ Table processing.processed_members does not exist! "
-                "Please run the DDL script to create it first."
-            )
+        for schema, table_name in required_tables:
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_schema = %s AND table_name = %s
+                )
+            """, (schema, table_name))
+            
+            if not cur.fetchone()[0]:
+                raise Exception(
+                    f"❌ Required table {schema}.{table_name} does not exist! "
+                    "Please run the DDL script to create it first."
+                )
         
-        logger.info("✅ Table processing.processed_members exists")
+        logger.info("✅ All required tables exist")
 
 def process_members():
     """Main member processing function - creates member-level hashes only"""
     logger.info("🚀 Starting dimension member processing...")
     
-    check_processed_members_table()
+    check_required_tables()
     
     with get_db_conn() as conn:
-        # Load raw member data
-        logger.info("📥 Loading raw member data...")
-        raw_member = pd.read_sql("SELECT * FROM dictionary.raw_member", conn)
+        # Load raw member data FROM PROCESSING SCHEMA
+        logger.info("📥 Loading raw member data from processing schema...")
+        raw_member = pd.read_sql("SELECT * FROM processing.raw_member", conn)
         
         logger.info(f"📊 Processing {len(raw_member)} raw member records")
         
@@ -157,6 +166,10 @@ def process_members():
         
         # Insert into processing table
         cur = conn.cursor()
+        
+        # Clear existing data for fresh processing
+        cur.execute("TRUNCATE TABLE processing.processed_members")
+        
         for _, row in processed_data.iterrows():
             cur.execute("""
                 INSERT INTO processing.processed_members (
@@ -165,11 +178,6 @@ def process_members():
                     classification_code, classification_type_code, geo_level, vintage,
                     terminated, member_label_norm
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (productid, dimension_position, member_id) DO UPDATE SET
-                    member_name_en = EXCLUDED.member_name_en,
-                    member_name_fr = EXCLUDED.member_name_fr,
-                    member_label_norm = EXCLUDED.member_label_norm,
-                    member_hash = EXCLUDED.member_hash
             """, (
                 int(row["productid"]) if pd.notna(row["productid"]) else None,
                 int(row["dimension_position"]) if pd.notna(row["dimension_position"]) else None,

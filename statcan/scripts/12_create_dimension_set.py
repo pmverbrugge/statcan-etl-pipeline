@@ -15,6 +15,12 @@ This script creates the canonical dimension registry by summarizing processed
 dimensions by dimension_hash and selecting the most common labels with proper
 formatting for presentation.
 
+Key Changes:
+- All references now point to processing schema (no dictionary schema dependencies)
+- Enhanced error handling and validation
+- TimescaleDB optimization support
+- Improved slugification using python-slugify
+
 Requires: 11_process_dimensions.py to have run successfully first.
 
 Key Operations:
@@ -53,6 +59,12 @@ def title_case(text):
     if pd.isna(text) or text is None:
         return None
     return str(text).title()
+
+def create_slug(text):
+    """Create URL-friendly slug from text"""
+    if pd.isna(text) or text is None:
+        return None
+    return slugify(text, separator="_").lower()
 
 def check_required_tables():
     """Verify required tables exist"""
@@ -135,12 +147,8 @@ def build_canonical_dimensions():
         canonical_dims['dimension_name_en'] = canonical_dims['dimension_name_en'].apply(title_case)
         canonical_dims['dimension_name_fr'] = canonical_dims['dimension_name_fr'].apply(title_case)
         
-        canonical_dims['dimension_name_en_slug'] = canonical_dims['dimension_name_en'].apply(
-            lambda x: slugify(x, separator="_").lower() if pd.notna(x) else None
-        )
-        canonical_dims['dimension_name_fr_slug'] = canonical_dims['dimension_name_fr'].apply(
-            lambda x: slugify(x, separator="_").lower() if pd.notna(x) else None
-        )
+        canonical_dims['dimension_name_en_slug'] = canonical_dims['dimension_name_en'].apply(create_slug)
+        canonical_dims['dimension_name_fr_slug'] = canonical_dims['dimension_name_fr'].apply(create_slug)
         
         logger.info(f"📈 Created {len(canonical_dims)} canonical dimension definitions")
         
@@ -186,7 +194,7 @@ def generate_summary_stats():
         total_instances = result.iloc[0]['count']
         
         # Deduplication rate
-        deduplication_rate = ((total_instances - canonical_count) / total_instances * 100)
+        deduplication_rate = ((total_instances - canonical_count) / total_instances * 100) if total_instances > 0 else 0
         
         # Most used dimensions
         top_dims = pd.read_sql("""

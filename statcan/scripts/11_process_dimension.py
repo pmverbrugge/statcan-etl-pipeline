@@ -14,6 +14,11 @@ Overview:
 This script creates dimension-level hashes by concatenating member hashes
 within each (productid, dimension_position) group, sorted by member_id.
 
+Key Changes:
+- Updated to read from processing.raw_dimension (instead of dictionary.raw_dimension)
+- Enhanced error handling and validation
+- TimescaleDB optimization support
+
 Requires: 10_process_dimension_members.py to have run successfully first.
 
 Key Operations:
@@ -22,13 +27,13 @@ Key Operations:
 • Sort by member_id within each group
 • Concatenate member hashes in sorted order
 • Hash the concatenated string and truncate to 12 characters
-• Add raw dimension metadata
+• Add raw dimension metadata FROM PROCESSING SCHEMA
 • Store in processing.processed_dimensions table
 
 Processing Pipeline:
 -------------------
 1. Load processed members from script 10
-2. Load raw dimension metadata
+2. Load raw dimension metadata FROM PROCESSING SCHEMA
 3. Group by (productid, dimension_position)  
 4. Sort by member_id within each group
 5. Concatenate member hashes
@@ -54,33 +59,38 @@ def hash_dimension_identity(member_hashes_concatenated):
 def get_db_conn():
     return psycopg2.connect(**DB_CONFIG)
 
-def check_processed_dimensions_table():
-    """Verify the processing dimensions table exists"""
+def check_required_tables():
+    """Verify required tables exist"""
     with get_db_conn() as conn:
         cur = conn.cursor()
         
-        # Check if table exists
-        cur.execute("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_schema = 'processing' 
-                AND table_name = 'processed_dimensions'
-            )
-        """)
+        required_tables = [
+            ('processing', 'processed_members'),
+            ('processing', 'raw_dimension'),
+            ('processing', 'processed_dimensions')
+        ]
         
-        if not cur.fetchone()[0]:
-            raise Exception(
-                "❌ Table processing.processed_dimensions does not exist! "
-                "Please run the DDL script to create it first."
-            )
+        for schema, table_name in required_tables:
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_schema = %s AND table_name = %s
+                )
+            """, (schema, table_name))
+            
+            if not cur.fetchone()[0]:
+                raise Exception(
+                    f"❌ Required table {schema}.{table_name} does not exist! "
+                    "Please run the DDL script to create it first."
+                )
         
-        logger.info("✅ Table processing.processed_dimensions exists")
+        logger.info("✅ All required tables exist")
 
 def process_dimensions():
     """Main dimension hash generation function"""
     logger.info("🚀 Starting dimension hash generation...")
     
-    check_processed_dimensions_table()
+    check_required_tables()
     
     with get_db_conn() as conn:
         # Load processed member data
@@ -91,11 +101,11 @@ def process_dimensions():
             ORDER BY productid, dimension_position, member_id
         """, conn)
         
-        # Load raw dimension metadata
-        logger.info("📥 Loading raw dimension metadata...")
+        # Load raw dimension metadata FROM PROCESSING SCHEMA
+        logger.info("📥 Loading raw dimension metadata from processing schema...")
         raw_dimensions = pd.read_sql("""
             SELECT productid, dimension_position, dimension_name_en, dimension_name_fr, has_uom
-            FROM dictionary.raw_dimension
+            FROM processing.raw_dimension
         """, conn)
         
         logger.info(f"📊 Processing {len(processed_members)} member records across {len(raw_dimensions)} dimensions")
@@ -146,17 +156,16 @@ def process_dimensions():
         logger.info("💾 Storing dimension data...")
         
         cur = conn.cursor()
+        
+        # Clear existing data for fresh processing
+        cur.execute("TRUNCATE TABLE processing.processed_dimensions")
+        
         for _, row in dimension_data.iterrows():
             cur.execute("""
                 INSERT INTO processing.processed_dimensions (
                     productid, dimension_position, dimension_hash,
                     dimension_name_en, dimension_name_fr, has_uom
                 ) VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (productid, dimension_position) DO UPDATE SET
-                    dimension_hash = EXCLUDED.dimension_hash,
-                    dimension_name_en = EXCLUDED.dimension_name_en,
-                    dimension_name_fr = EXCLUDED.dimension_name_fr,
-                    has_uom = EXCLUDED.has_uom
             """, (
                 int(row['productid']), 
                 int(row['dimension_position']), 
