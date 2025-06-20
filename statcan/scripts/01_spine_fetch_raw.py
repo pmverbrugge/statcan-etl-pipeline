@@ -29,7 +29,7 @@ Protection Mechanisms:
 - Atomic database operations with rollback capability
 
 Last Updated: June 2025
-Author: Paul Verbrugge
+Author: Paul Verbrugge with Claude 3.5 Sonnet (v20241022)e
 """
 
 # statcan/scripts/01_spine_fetch_raw.py

@@ -40,7 +40,7 @@ Dependencies:
 - Updates raw_files.cube_status for download management
 
 Last Updated: June 2025
-Author: Paul Verbrugge
+Author: Paul Verbrugge with Claude 3.5 Sonnet (v20241022)
 """
 
 from datetime import date, datetime, time, timedelta, timezone

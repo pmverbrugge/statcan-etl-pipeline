@@ -39,7 +39,7 @@ Dependencies:
 - Uses raw_files.metadata_status table for download tracking
 
 Last Updated: June 2025
-Author: Paul Verbrugge
+Author: Paul Verbrugge with Claude Sonnet 3.5 (Anthropic)
 """
 
 import psycopg2

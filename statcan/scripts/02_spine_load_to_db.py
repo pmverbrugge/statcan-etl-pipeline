@@ -34,7 +34,7 @@ Dependencies:
 - Connects to PostgreSQL spine schema tables
 
 Last Updated: June 2025
-Author: Paul Verbrugge
+Author: Paul Verbrugge with Claude 3.5 Sonnet (v20241022)e
 """
 
 import os

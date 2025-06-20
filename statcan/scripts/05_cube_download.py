@@ -1,7 +1,88 @@
+#!/usr/bin/env python3
 """
-Download StatCan data cubes with granular status tracking.
-Uses getFullTableDownloadCSV endpoint to download cube zip files.
-Updates raw_files.manage_cube_raw_files and cube_status progressively.
+Statistics Canada Cube Data Download Manager
+===========================================
+
+Script:     05_cube_download.py
+Purpose:    Automated download and tracking of StatCan data cube ZIP files
+Author:     Paul Verbrugge with Claude Sonnet 4 (Anthropic)
+Created:    2025
+Updated:    June 2025
+
+Overview:
+--------
+This script manages the systematic download of Statistics Canada data cubes using 
+the Web Data Service (WDS) API. It processes cubes marked as 'download_pending' in 
+the cube_status table, downloads compressed CSV files via the getFullTableDownloadCSV 
+endpoint, and maintains comprehensive file tracking with hash-based deduplication.
+
+Key Features:
+------------
+• Granular status tracking with progressive updates during download process
+• Content-based deduplication using SHA-256 file hashing
+• Robust error handling with per-cube failure isolation
+• Polite API usage with 2-second delays between requests
+• Comprehensive logging with emoji indicators for easy monitoring
+• Atomic database operations with rollback capability
+• File versioning and archival of superseded downloads
+
+Data Flow:
+---------
+1. Query raw_files.cube_status for cubes with download_pending = TRUE
+2. For each pending cube:
+   a. Mark download initiation timestamp
+   b. Retrieve download URL from WDS API
+   c. Download and hash file content
+   d. Check for duplicate files using hash comparison
+   e. Save file to /app/raw/cubes/ with hash-based naming
+   f. Update raw_files.manage_cube_raw_files with file metadata
+   g. Mark cube_status as complete (download_pending = FALSE)
+
+Database Tables Modified:
+------------------------
+• raw_files.cube_status - Download completion tracking
+• raw_files.manage_cube_raw_files - File inventory and metadata
+
+API Endpoints Used:
+------------------
+• GET /t1/wds/rest/getFullTableDownloadCSV/{productid}/en
+
+File Storage:
+------------
+• Location: /app/raw/cubes/
+• Naming: {productid}_{hash_prefix}.zip
+• Retention: Managed by file verification script (06_cube_verify_files.py)
+
+Error Handling:
+--------------
+• Network timeouts: 5-minute download timeout per file
+• API failures: Logged with retry capability maintained
+• Disk I/O errors: Isolated per-cube with batch continuation
+• Database errors: Transactional rollback with error logging
+
+Integration:
+-----------
+• Preceded by: 04_cube_status_update.py (change detection)
+• Followed by: 06_cube_verify_files.py (integrity verification)
+• Monitored via: /app/logs/fetch_cubes.log
+
+Performance Notes:
+-----------------
+• Processes all pending cubes in single batch
+• 2-second delay between downloads for API politeness
+• Duplicate detection prevents redundant storage
+• Progressive status updates enable restart capability
+
+Usage:
+------
+python 05_cube_download.py
+
+Environment Requirements:
+------------------------
+• Network access to Statistics Canada WDS API
+• Write permissions to /app/raw/cubes/ directory
+• PostgreSQL connection via statcan.tools.config.DB_CONFIG
+• Sufficient disk space for compressed cube files (typically 1KB-100MB each)
 """
 
 import os

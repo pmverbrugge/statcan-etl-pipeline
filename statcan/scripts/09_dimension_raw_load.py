@@ -45,7 +45,7 @@ Dependencies:
 - Populates dictionary.raw_dimension and dictionary.raw_member tables
 
 Last Updated: June 2025
-Author: Paul Verbrugge
+Author: Paul Verbrugge with Claude Sonnet 3.5 (Anthropic)
 """
 
 import psycopg2

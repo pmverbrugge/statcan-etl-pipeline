@@ -1,5 +1,114 @@
+#!/usr/bin/env python3
 """
-Verify raw cube files against database log and reset download flags if missing or corrupted.
+Statistics Canada Cube File Integrity Verification System
+=========================================================
+
+Script:     06_cube_verify_files.py
+Purpose:    Validate integrity of downloaded cube files and trigger re-downloads when needed
+Author:     Paul Verbrugge with Claude Sonnet 4 (Anthropic)
+Created:    2025
+Updated:    June 2025
+
+Overview:
+--------
+This critical data integrity script validates that all active cube files in the raw file 
+inventory exist on disk and match their recorded SHA-256 hashes. When files are missing 
+or corrupted, the script automatically cleans up the database records and triggers 
+re-downloads by resetting the download_pending flag in cube_status.
+
+Key Features:
+------------
+• Complete file integrity verification using SHA-256 hash validation
+• Automatic cleanup of missing or corrupted files
+• Self-healing architecture that triggers re-downloads for failed files
+• Atomic database operations with immediate commits per file
+• Comprehensive logging with emoji indicators for monitoring
+• Fail-fast approach with individual file error isolation
+
+Verification Process:
+-------------------
+1. Query all active cube files from raw_files.manage_cube_raw_files
+2. For each recorded file:
+   a. Check physical file existence at storage_location
+   b. Calculate SHA-256 hash of file contents
+   c. Compare calculated hash with recorded file_hash
+   d. If file missing or hash mismatch:
+      - Delete physical file (if corrupted)
+      - Remove database record from manage_cube_raw_files
+      - Set download_pending = TRUE in cube_status for re-download
+   e. Log verification result
+
+Database Tables Modified:
+------------------------
+• raw_files.manage_cube_raw_files - Remove invalid file records
+• raw_files.cube_status - Reset download_pending flag for failed files
+
+File Operations:
+---------------
+• Read verification: All active cube files in /app/raw/cubes/
+• Delete operation: Corrupted files that fail hash validation
+• No file creation or modification (read-only verification)
+
+Error Handling:
+--------------
+• Missing files: Database cleanup and re-download trigger
+• Hash mismatches: File deletion, database cleanup, re-download trigger
+• File deletion failures: Logged but don't prevent database cleanup
+• Database errors: Individual file processing continues on error
+
+Self-Healing Behavior:
+---------------------
+The script implements automatic recovery by:
+• Removing invalid database records to maintain consistency
+• Triggering re-downloads via download_pending flag
+• Deleting corrupted files to free disk space
+• Logging all actions for audit trail
+
+Integration Points:
+------------------
+• Follows: 05_cube_download.py (initial file download)
+• Triggers: Re-execution of 05_cube_download.py for failed files
+• Monitored via: /app/logs/verify_raw_files.log
+• Scheduled: Should run after download batches or on schedule
+
+Performance Characteristics:
+---------------------------
+• I/O intensive: Reads entire content of each file for hashing
+• Memory efficient: Processes files individually
+• Database efficient: Single query to get file list, individual updates
+• Scale: Processes all active files in single run
+
+Usage Scenarios:
+---------------
+• Post-download verification after batch cube downloads
+• Scheduled integrity checks (daily/weekly)
+• Diagnostic runs when data quality issues suspected
+• Recovery operations after disk/network issues
+
+Usage:
+------
+python 06_cube_verify_files.py
+
+Environment Requirements:
+------------------------
+• Read access to /app/raw/cubes/ directory
+• Write/delete permissions for cube files
+• PostgreSQL connection via statcan.tools.config.DB_CONFIG
+• Sufficient I/O capacity for hash calculation of large files
+
+Monitoring:
+----------
+• Success indicator: "✅ Verified {productid}: {filename}" messages
+• Failure indicators: "❌ File missing" or "⚠️ Hash mismatch" messages
+• Cleanup actions: "🗑️ Corrupted file deleted" messages
+• Overall status: "🎯 Verification complete" on successful run
+
+Data Quality Assurance:
+----------------------
+This script is essential for maintaining data integrity in the ETL pipeline.
+It ensures that downstream processing (cube ingestion, analysis) operates on
+validated, uncorrupted source files. The self-healing aspect reduces manual
+intervention and improves pipeline reliability.
 """
 
 import os

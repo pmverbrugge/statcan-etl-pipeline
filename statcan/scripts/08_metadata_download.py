@@ -43,7 +43,7 @@ Dependencies:
 - Updates raw_files.metadata_status for download management
 
 Last Updated: June 2025
-Author: Paul Verbrugge
+Author: Paul Verbrugge with Claude Sonnet 3.5 (Anthropic)
 """
 
 import os

@@ -36,7 +36,7 @@ Dependencies:
 - Uses raw_files.cube_status table for download tracking
 
 Last Updated: June 2025
-Author: Paul Verbrugge
+Author: Paul Verbrugge with Claude 3.5 Sonnet (v20241022)
 """
 
 import psycopg2
