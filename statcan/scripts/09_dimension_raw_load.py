@@ -5,367 +5,359 @@ Script: 09_dimension_raw_load.py
 Date: 2025-06-21
 Author: Paul Verbrugge with Claude Sonnet 4 (Anthropic)
 
-Ingest dimension metadata from downloaded cube metadata files into raw processing tables.
-Parses JSON metadata files and extracts dimension definitions and member details
-using DuckDB for efficient processing of large metadata files.
+Enhanced dimension metadata ingestion from downloaded JSON files into raw processing tables.
 
-This script reads metadata files downloaded by script 08 and populates:
-- processing.raw_dimension: Dimension-level metadata (names, UOM flags)
-- processing.raw_member: Member-level metadata (codes, labels, hierarchies)
+This script processes StatCan cube metadata files and extracts dimension definitions and 
+member details into the processing schema for downstream normalization. It implements 
+comprehensive validation, batch processing, and error recovery mechanisms.
 
 Key Operations:
-- Load metadata file paths from raw_files.metadata_status
-- Parse JSON files using DuckDB for memory efficiency
-- Extract dimension and member data with proper data types
-- Insert into processing tables using batch operations
-- Handle duplicate records with conflict resolution
-- Validate data completeness and report statistics
+- Load metadata files based on metadata_status tracking table
+- Extract dimension definitions and member hierarchies from JSON
+- Insert raw data into processing.raw_dimension and processing.raw_member tables
+- Comprehensive validation and data quality checks
+- Batch processing with progress tracking and error isolation
 
-Processing Approach:
-Uses DuckDB's JSON functions to efficiently parse large metadata files
-without loading entire files into Python memory. Processes files in batches
-and uses PostgreSQL COPY for optimal insert performance.
+Processing Logic:
+1. Query metadata_status for completed downloads with file hashes
+2. Validate file existence and JSON structure
+3. Extract dimension metadata with proper null handling
+4. Batch insert with conflict resolution and progress tracking
+5. Validate final results and generate summary statistics
 
 Dependencies:
-- Metadata files downloaded by script 08
-- processing.raw_dimension and processing.raw_member tables (DDL)
-- raw_files.metadata_status tracking table
+- Requires metadata files from 08_metadata_download.py
+- Uses raw_files.metadata_status for file tracking
+- Populates processing.raw_dimension and processing.raw_member tables
 """
 
-import json
-import os
 import psycopg2
+import json
 from pathlib import Path
 from loguru import logger
 from statcan.tools.config import DB_CONFIG
 
-# Configure logging with rotation and retention
-logger.add("/app/logs/load_raw_dimensions.log", rotation="10 MB", retention="7 days")
+# Configure logging with standardized format
+logger.add("/app/logs/load_raw_dimensions.log", rotation="5 MB", retention="7 days")
 
-# Constants
+# Configuration constants
 METADATA_DIR = Path("/app/raw/metadata")
-BATCH_SIZE = 100  # Process files in batches for memory management
+BATCH_SIZE = 100  # Process files in batches for better memory management
+MIN_FILE_SIZE = 1000  # Minimum expected file size in bytes
 
-def check_required_tables():
-    """Verify required tables and metadata files exist"""
-    logger.info("🔍 Validating prerequisites...")
+# Optimized SQL statements for batch processing
+INSERT_DIM_SQL = """
+    INSERT INTO processing.raw_dimension (
+        productid, dimension_position, dimension_name_en, dimension_name_fr, has_uom
+    ) VALUES (%s, %s, %s, %s, %s)
+    ON CONFLICT (productid, dimension_position) DO NOTHING
+"""
+
+INSERT_MEMBER_SQL = """
+    INSERT INTO processing.raw_member (
+        productid, dimension_position, member_id, parent_member_id, 
+        classification_code, classification_type_code, member_name_en, 
+        member_name_fr, member_uom_code, geo_level, vintage, terminated
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (productid, dimension_position, member_id) DO NOTHING
+"""
+
+def safe_int(value):
+    """Safely convert value to integer, returning None for invalid values"""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+def safe_bool(value):
+    """Safely convert value to boolean, handling various input types"""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ('true', '1', 'yes')
+    return bool(value)
+
+def validate_metadata_file(file_path: Path, productid: int) -> dict:
+    """Validate metadata file exists and has valid JSON structure"""
+    if not file_path.exists():
+        return {'valid': False, 'error': f"File not found: {file_path.name}", 'data': None}
+    
+    # Check file size
+    file_size = file_path.stat().st_size
+    if file_size < MIN_FILE_SIZE:
+        return {'valid': False, 'error': f"File too small: {file_size} bytes", 'data': None}
+    
+    # Validate JSON structure
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        # Validate basic structure
+        if not isinstance(data, list) or len(data) == 0:
+            return {'valid': False, 'error': "Invalid JSON structure", 'data': None}
+        
+        # Check for required fields
+        obj = data[0].get("object", {})
+        if "productId" not in obj:
+            return {'valid': False, 'error': "Missing productId in metadata", 'data': None}
+        
+        # Validate product ID matches expected
+        if safe_int(obj.get("productId")) != productid:
+            return {'valid': False, 'error': f"Product ID mismatch: expected {productid}, got {obj.get('productId')}", 'data': None}
+        
+        return {'valid': True, 'error': None, 'data': data}
+        
+    except json.JSONDecodeError as e:
+        return {'valid': False, 'error': f"Invalid JSON: {e}", 'data': None}
+    except Exception as e:
+        return {'valid': False, 'error': f"File validation error: {e}", 'data': None}
+
+def get_metadata_files_to_process():
+    """Get list of metadata files to process from metadata_status table"""
+    logger.info("📥 Loading metadata file list from database...")
     
     with psycopg2.connect(**DB_CONFIG) as conn:
-        cur = conn.cursor()
-        
-        # Check metadata status table
-        cur.execute("SELECT COUNT(*) FROM raw_files.metadata_status WHERE last_file_hash IS NOT NULL")
-        metadata_count = cur.fetchone()[0]
-        
-        if metadata_count == 0:
-            raise Exception("❌ No metadata files found! Run script 08 first.")
-        
-        # Check output tables exist
-        required_tables = [
-            ('processing', 'raw_dimension'),
-            ('processing', 'raw_member')
-        ]
-        
-        for schema, table_name in required_tables:
+        with conn.cursor() as cur:
             cur.execute("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_schema = %s AND table_name = %s
-                )
-            """, (schema, table_name))
+                SELECT productid, last_file_hash
+                FROM raw_files.metadata_status
+                WHERE download_pending = FALSE 
+                  AND last_file_hash IS NOT NULL
+                ORDER BY productid
+            """)
+            records = cur.fetchall()
+    
+    logger.info(f"📋 Found {len(records)} completed metadata entries to process")
+    return records
+
+def process_dimension_metadata(data: list, productid: int):
+    """Extract dimension and member data from JSON metadata"""
+    obj = data[0].get("object", {})
+    dimensions_data = []
+    members_data = []
+    skipped_dims = 0
+    skipped_members = 0
+    
+    for dim in obj.get("dimension", []):
+        # Extract dimension data
+        position = safe_int(dim.get("dimensionPositionId"))
+        dim_name_en = dim.get("dimensionNameEn")
+        dim_name_fr = dim.get("dimensionNameFr")
+        has_uom = safe_bool(dim.get("hasUom"))
+        
+        # Skip dimensions with invalid positions (count for reporting)
+        if position is None:
+            skipped_dims += 1
+            continue
+        
+        dimensions_data.append((
+            productid, position, dim_name_en, dim_name_fr, has_uom
+        ))
+        
+        # Extract member data
+        for member in dim.get("member", []):
+            member_id = safe_int(member.get("memberId"))
             
-            if not cur.fetchone()[0]:
-                raise Exception(
-                    f"❌ Required table {schema}.{table_name} does not exist! "
-                    "Please run the DDL script to create it first."
-                )
-        
-        logger.success(f"✅ Prerequisites validated: {metadata_count:,} metadata files available")
-        return metadata_count
-
-def get_metadata_files():
-    """Get list of metadata files to process"""
-    logger.info("📋 Loading metadata file list...")
-    
-    with psycopg2.connect(**DB_CONFIG) as conn:
-        cur = conn.cursor()
-        
-        # Get active metadata files with their product IDs
-        cur.execute("""
-            SELECT ms.productid, mmrf.storage_location, mmrf.file_hash
-            FROM raw_files.metadata_status ms
-            JOIN raw_files.manage_metadata_raw_files mmrf 
-                ON ms.productid = mmrf.productid AND mmrf.active = true
-            WHERE ms.last_file_hash IS NOT NULL
-            ORDER BY ms.productid
-        """)
-        
-        files = cur.fetchall()
-        
-        # Validate files exist on disk
-        valid_files = []
-        for productid, file_path, file_hash in files:
-            if os.path.exists(file_path):
-                valid_files.append((productid, file_path, file_hash))
-            else:
-                logger.warning(f"⚠️ Missing file for product {productid}: {file_path}")
-        
-        logger.info(f"📁 Found {len(valid_files):,} valid metadata files")
-        return valid_files
-
-def process_metadata_batch(files_batch):
-    """Process a batch of metadata files using direct PostgreSQL operations"""
-    logger.info(f"🔄 Processing batch of {len(files_batch)} metadata files...")
-    
-    dimension_count = 0
-    member_count = 0
-    
-    with psycopg2.connect(**DB_CONFIG) as pg_conn:
-        cur = pg_conn.cursor()
-        
-        # Process each file in the batch
-        for productid, file_path, file_hash in files_batch:
-            try:
-                # Validate JSON file structure
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    metadata = json.load(f)
-                
-                # Expect array with single object containing metadata
-                if not isinstance(metadata, list) or len(metadata) == 0:
-                    logger.warning(f"⚠️ Invalid metadata structure for product {productid}")
-                    continue
-                
-                metadata_obj = metadata[0].get('object', {})
-                if not isinstance(metadata_obj, dict):
-                    logger.warning(f"⚠️ No metadata object found for product {productid}")
-                    continue
-                
-                dimensions = metadata_obj.get('dimension', [])
-                if not dimensions:
-                    logger.warning(f"⚠️ No dimensions found for product {productid}")
-                    continue
-                
-                # Process dimensions for this product
-                file_dimensions = 0
-                file_members = 0
-                
-                for dim_idx, dimension in enumerate(dimensions):
-                    dimension_position = dim_idx + 1  # 1-based positioning
-                    
-                    # Extract dimension metadata
-                    dim_name_en = dimension.get('dimensionNameEn', '')
-                    dim_name_fr = dimension.get('dimensionNameFr', '')
-                    has_uom = dimension.get('hasUom', False)
-                    
-                    # Insert dimension record
-                    cur.execute("""
-                        INSERT INTO processing.raw_dimension (
-                            productid, dimension_position, dimension_name_en, 
-                            dimension_name_fr, has_uom
-                        ) VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT (productid, dimension_position) DO NOTHING
-                    """, (productid, dimension_position, dim_name_en, dim_name_fr, has_uom))
-                    
-                    file_dimensions += 1
-                    
-                    # Process members for this dimension
-                    members = dimension.get('member', [])
-                    for member in members:
-                        # Extract member data with proper type conversion
-                        member_id = member.get('memberId')
-                        if member_id is None:
-                            continue
-                        
-                        try:
-                            member_id = int(member_id)
-                        except (ValueError, TypeError):
-                            logger.warning(f"⚠️ Invalid member_id for product {productid}: {member.get('memberId')}")
-                            continue
-                        
-                        # Extract other member fields
-                        parent_id = member.get('parentMemberId')
-                        if parent_id is not None:
-                            try:
-                                parent_id = int(parent_id)
-                            except (ValueError, TypeError):
-                                parent_id = None
-                        
-                        member_name_en = member.get('memberNameEn', '')
-                        member_name_fr = member.get('memberNameFr', '')
-                        member_uom_code = member.get('memberUomCode')
-                        classification_code = member.get('classificationCode')
-                        classification_type_code = member.get('classificationTypeCode')
-                        
-                        # Handle geo_level and vintage
-                        geo_level = member.get('geoLevel')
-                        if geo_level is not None:
-                            try:
-                                geo_level = int(geo_level)
-                            except (ValueError, TypeError):
-                                geo_level = None
-                        
-                        vintage = member.get('vintage')
-                        if vintage is not None:
-                            try:
-                                vintage = int(vintage)
-                            except (ValueError, TypeError):
-                                vintage = None
-                        
-                        # Handle terminated flag
-                        terminated = member.get('terminated', 0)
-                        try:
-                            terminated = int(terminated)
-                        except (ValueError, TypeError):
-                            terminated = 0
-                        
-                        # Insert member record
-                        cur.execute("""
-                            INSERT INTO processing.raw_member (
-                                productid, dimension_position, member_id, parent_member_id,
-                                classification_code, classification_type_code, member_name_en, 
-                                member_name_fr, member_uom_code, geo_level, vintage, terminated
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (productid, dimension_position, member_id) DO NOTHING
-                        """, (
-                            productid, dimension_position, member_id, parent_id,
-                            classification_code, classification_type_code, member_name_en,
-                            member_name_fr, member_uom_code, geo_level, vintage, terminated
-                        ))
-                        
-                        file_members += 1
-                
-                dimension_count += file_dimensions
-                member_count += file_members
-                
-                # Only log individual products that have issues or are unusually large
-                if file_dimensions == 0:
-                    logger.warning(f"⚠️ Product {productid}: No dimensions found")
-                elif file_dimensions > 20:  # Log unusually complex cubes
-                    logger.info(f"📊 Product {productid}: {file_dimensions} dimensions, {file_members} members (complex cube)")
-                
-            except Exception as e:
-                logger.error(f"❌ Failed to process metadata for product {productid}: {e}")
+            # Skip members with invalid IDs (count for reporting)
+            if member_id is None:
+                skipped_members += 1
                 continue
-        
-        # Commit batch
-        pg_conn.commit()
-        
-        logger.success(f"✅ Batch processed: {dimension_count} dimensions, {member_count} members")
-        return dimension_count, member_count
+            
+            members_data.append((
+                productid,
+                position,
+                member_id,
+                safe_int(member.get("parentMemberId")),
+                member.get("classificationCode"),
+                member.get("classificationTypeCode"),
+                member.get("memberNameEn"),
+                member.get("memberNameFr"),
+                member.get("memberUomCode"),
+                safe_int(member.get("geoLevel")),
+                safe_int(member.get("vintage")),
+                safe_int(member.get("terminated"))
+            ))
+    
+    return dimensions_data, members_data, skipped_dims, skipped_members
 
-def clear_existing_data():
-    """Clear existing raw dimension data for fresh load"""
-    logger.info("🗑️ Clearing existing raw dimension data...")
+def batch_insert_data(cur, dimensions_data: list, members_data: list):
+    """Perform batch insertion of dimension and member data"""
+    
+    # Insert dimensions
+    if dimensions_data:
+        cur.executemany(INSERT_DIM_SQL, dimensions_data)
+        dim_inserted = cur.rowcount
+    else:
+        dim_inserted = 0
+    
+    # Insert members
+    if members_data:
+        cur.executemany(INSERT_MEMBER_SQL, members_data)
+        member_inserted = cur.rowcount
+    else:
+        member_inserted = 0
+    
+    return dim_inserted, member_inserted
+
+def process_file_batch(records_batch: list, batch_num: int, total_batches: int):
+    """Process a batch of metadata files with comprehensive error handling"""
+    
+    batch_stats = {
+        'processed': 0,
+        'failed': 0,
+        'dimensions_inserted': 0,
+        'members_inserted': 0,
+        'validation_failures': 0,
+        'total_skipped_dims': 0,
+        'total_skipped_members': 0
+    }
     
     with psycopg2.connect(**DB_CONFIG) as conn:
-        cur = conn.cursor()
-        
-        # Get counts before clearing
-        cur.execute("SELECT COUNT(*) FROM processing.raw_member")
-        existing_members = cur.fetchone()[0]
-        
-        cur.execute("SELECT COUNT(*) FROM processing.raw_dimension")
-        existing_dimensions = cur.fetchone()[0]
-        
-        if existing_members > 0 or existing_dimensions > 0:
-            logger.info(f"📊 Clearing {existing_dimensions:,} dimensions and {existing_members:,} members")
+        with conn.cursor() as cur:
+            for productid, file_hash in records_batch:
+                try:
+                    # Construct file path
+                    filename = f"{productid}_{file_hash[:16]}.json"
+                    file_path = METADATA_DIR / filename
+                    
+                    # Validate file
+                    validation = validate_metadata_file(file_path, productid)
+                    
+                    if not validation['valid']:
+                        batch_stats['validation_failures'] += 1
+                        continue
+                    
+                    # Process metadata
+                    dimensions_data, members_data, skipped_dims, skipped_members = process_dimension_metadata(validation['data'], productid)
+                    
+                    # Track skipped items for summary
+                    batch_stats['total_skipped_dims'] += skipped_dims
+                    batch_stats['total_skipped_members'] += skipped_members
+                    
+                    # Batch insert
+                    dim_count, member_count = batch_insert_data(cur, dimensions_data, members_data)
+                    
+                    batch_stats['processed'] += 1
+                    batch_stats['dimensions_inserted'] += dim_count
+                    batch_stats['members_inserted'] += member_count
+                    
+                except Exception as e:
+                    logger.error(f"❌ Error processing {productid}: {e}")
+                    batch_stats['failed'] += 1
+                    continue
             
-            # Truncate tables
-            cur.execute("TRUNCATE TABLE processing.raw_member CASCADE")
-            cur.execute("TRUNCATE TABLE processing.raw_dimension CASCADE")
+            # Commit batch
             conn.commit()
-            
-            logger.success("✅ Existing data cleared")
-        else:
-            logger.info("ℹ️ No existing data to clear")
-
-def generate_summary_statistics():
-    """Generate and log summary statistics"""
-    logger.info("📊 Generating load statistics...")
     
+    return batch_stats
+
+def validate_final_results():
+    """Validate final insertion results and generate summary statistics"""
     with psycopg2.connect(**DB_CONFIG) as conn:
-        cur = conn.cursor()
-        
-        # Dimension statistics
-        cur.execute("""
-            SELECT 
-                COUNT(*) as total_dimensions,
-                COUNT(DISTINCT productid) as unique_products,
-                COUNT(*) FILTER (WHERE has_uom = true) as uom_dimensions
-            FROM processing.raw_dimension
-        """)
-        dim_total, dim_products, uom_dims = cur.fetchone()
-        
-        # Member statistics
-        cur.execute("""
-            SELECT 
-                COUNT(*) as total_members,
-                COUNT(DISTINCT productid) as unique_products,
-                COUNT(*) FILTER (WHERE parent_member_id IS NOT NULL) as hierarchical_members,
-                COUNT(*) FILTER (WHERE member_uom_code IS NOT NULL) as members_with_uom
-            FROM processing.raw_member
-        """)
-        mem_total, mem_products, hierarchical, with_uom = cur.fetchone()
-        
-        # Average members per dimension
-        avg_members = mem_total / dim_total if dim_total > 0 else 0
-        
-        logger.success("📈 Load Summary:")
-        logger.success(f"   • {dim_total:,} dimensions across {dim_products:,} products")
-        logger.success(f"   • {mem_total:,} members across {mem_products:,} products")
-        logger.success(f"   • {avg_members:.1f} average members per dimension")
-        logger.success(f"   • {uom_dims:,} dimensions with unit of measure")
-        logger.success(f"   • {hierarchical:,} members with parent relationships")
-        logger.success(f"   • {with_uom:,} members with UOM codes")
+        with conn.cursor() as cur:
+            # Count inserted records
+            cur.execute("SELECT COUNT(*) FROM processing.raw_dimension")
+            dim_count = cur.fetchone()[0]
+            
+            cur.execute("SELECT COUNT(*) FROM processing.raw_member")
+            member_count = cur.fetchone()[0]
+            
+            # Check for data quality issues
+            cur.execute("""
+                SELECT 
+                    COUNT(*) FILTER (WHERE dimension_name_en IS NULL) as null_en_names,
+                    COUNT(DISTINCT productid) as unique_products
+                FROM processing.raw_dimension
+            """)
+            dim_null_en, unique_products = cur.fetchone()
+            
+            cur.execute("""
+                SELECT 
+                    COUNT(*) FILTER (WHERE member_name_en IS NULL) as null_en_names,
+                    COUNT(*) FILTER (WHERE parent_member_id IS NOT NULL) as with_parents
+                FROM processing.raw_member
+            """)
+            mem_null_en, mem_with_parents = cur.fetchone()
+    
+    # Calculate hierarchy rate
+    hierarchy_rate = (mem_with_parents / member_count * 100) if member_count > 0 else 0
+    
+    return {
+        'dimensions': dim_count,
+        'members': member_count,
+        'products': unique_products,
+        'hierarchy_rate': hierarchy_rate,
+        'dim_null_en': dim_null_en,
+        'mem_null_en': mem_null_en
+    }
 
 def main():
-    """Main dimension loading function"""
+    """Main metadata ingestion function with enhanced error handling and validation"""
+    logger.info("🚀 Starting dimension metadata ingestion...")
+    
     try:
-        # Validate prerequisites
-        metadata_count = check_required_tables()
+        # Get files to process
+        records = get_metadata_files_to_process()
         
-        # Get metadata files to process
-        metadata_files = get_metadata_files()
-        
-        if not metadata_files:
-            logger.warning("⚠️ No valid metadata files found")
+        if not records:
+            logger.info("📊 No metadata files found for processing")
             return
         
-        # Clear existing data for fresh load
-        clear_existing_data()
+        logger.info(f"📊 Processing {len(records)} metadata files...")
         
-        # Process files in batches for memory efficiency
-        total_dimensions = 0
-        total_members = 0
+        # Process in batches
+        total_stats = {
+            'processed': 0,
+            'failed': 0,
+            'dimensions_inserted': 0,
+            'members_inserted': 0,
+            'validation_failures': 0,
+            'total_skipped_dims': 0,
+            'total_skipped_members': 0
+        }
         
-        logger.info(f"🚀 Processing {len(metadata_files):,} metadata files in batches...")
+        # Calculate batch parameters
+        total_batches = (len(records) + BATCH_SIZE - 1) // BATCH_SIZE
         
-        for i in range(0, len(metadata_files), BATCH_SIZE):
-            batch = metadata_files[i:i + BATCH_SIZE]
+        # Process batches
+        for i in range(0, len(records), BATCH_SIZE):
+            batch = records[i:i + BATCH_SIZE]
             batch_num = (i // BATCH_SIZE) + 1
-            total_batches = (len(metadata_files) + BATCH_SIZE - 1) // BATCH_SIZE
             
-            logger.info(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch)} files)")
+            # Progress logging for long operations
+            if len(records) > 1000 and i % 1000 == 0:
+                logger.info(f"📈 Progress: {i:,}/{len(records):,} files processed")
             
-            try:
-                dim_count, mem_count = process_metadata_batch(batch)
-                total_dimensions += dim_count
-                total_members += mem_count
-                
-                logger.info(f"✅ Batch {batch_num} complete: +{dim_count} dimensions, +{mem_count} members")
-                
-            except Exception as e:
-                logger.error(f"❌ Batch {batch_num} failed: {e}")
-                continue
+            batch_stats = process_file_batch(batch, batch_num, total_batches)
+            
+            # Accumulate statistics
+            for key in total_stats:
+                total_stats[key] += batch_stats[key]
         
-        # Generate summary statistics
-        generate_summary_statistics()
+        # Validate final results
+        final_results = validate_final_results()
         
-        logger.success("🎉 Raw dimension loading completed successfully!")
-        logger.info("🔄 Next step: Run script 10 (process_dimension_members.py)")
+        # Final summary
+        logger.success(f"✅ Metadata ingestion complete: {total_stats['processed']} processed, {total_stats['failed']} failed")
+        
+        # Warn about concerning issues
+        if total_stats['failed'] > 0:
+            failure_rate = total_stats['failed'] / len(records) * 100
+            if failure_rate > 10:
+                logger.warning(f"⚠️ High failure rate: {failure_rate:.1f}% - investigate logs")
+        
+        if final_results['dim_null_en'] > 0 or final_results['mem_null_en'] > 0:
+            logger.warning(f"⚠️ Data quality issues: {final_results['dim_null_en']} dims, {final_results['mem_null_en']} members missing English names")
+        
+        if total_stats['total_skipped_dims'] > 0 or total_stats['total_skipped_members'] > 0:
+            logger.warning(f"⚠️ Skipped invalid data: {total_stats['total_skipped_dims']} dimensions, {total_stats['total_skipped_members']} members")
         
     except Exception as e:
-        logger.exception(f"❌ Raw dimension loading failed: {e}")
+        logger.exception(f"❌ Metadata ingestion failed: {e}")
         raise
 
 if __name__ == "__main__":
