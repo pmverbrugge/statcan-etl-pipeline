@@ -1,240 +1,308 @@
 #!/usr/bin/env python3
 """
-Statistics Canada Dimension Set Members Builder
-==============================================
+Statcan Public Data ETL Pipeline
+Script: 13_create_dimension_set_members.py
+Date: 2025-06-21
+Author: Paul Verbrugge with Claude Sonnet 4 (Anthropic)
 
-Script:     13_create_dimension_set_members.py
-Purpose:    Create canonical member definitions for each dimension
-Author:     Paul Verbrugge with Claude Sonnet 4 (Anthropic)
-Created:    2025
-Updated:    June 2025
+Create canonical member definitions for each dimension with deduplication and normalization.
 
-Overview:
---------
-This script creates canonical member definitions by joining processed members
-with their dimension hashes and summarizing to select the most common member
-attributes within each dimension.
-
-Requires: 10_process_dimension_members.py and 11_process_dimensions.py to have run first.
+This script creates canonical member definitions by joining processed members with their
+dimension hashes and selecting the most common member attributes within each dimension.
+The result provides normalized member definitions that can be reused across cubes.
 
 Key Operations:
---------------
-• Join processed_members with processed_dimensions on (productid, dimension_position)
-• Group by (dimension_hash, member_id) 
-• Select most common member names (English and French)
-• Preserve parent_member_id and member_uom_code
-• Store canonical member definitions in processing.dimension_set_members
+- Populate dimension_hash in processed_members from processed_dimensions
+- Group members by (dimension_hash, member_id) for canonical definitions
+- Select most common member names using SQL mode calculation
+- Preserve hierarchical relationships and unit of measure codes
+- Store canonical member definitions in processing.dimension_set_members
 
-Processing Pipeline:
--------------------
-1. Load processed members and processed dimensions
-2. Join on (productid, dimension_position) to get dimension_hash for each member
-3. Group by (dimension_hash, member_id) and select most common attributes
-4. Store canonical member definitions
-5. Generate summary statistics
+Processing Logic:
+1. Update processed_members with dimension_hash from processed_dimensions
+2. Use SQL aggregation to build canonical member definitions
+3. Select most common English/French names using subquery mode calculation
+4. Preserve parent_member_id and member_uom_code relationships
+5. Calculate usage statistics across cube instances
+6. Store canonical definitions with comprehensive validation
+
+Dependencies:
+- Requires processing.processed_members from 10_process_dimension_members.py
+- Requires processing.processed_dimensions from 11_process_dimension.py
+- Outputs to processing.dimension_set_members for canonical member registry
 """
 
-import pandas as pd
 import psycopg2
 from loguru import logger
 from statcan.tools.config import DB_CONFIG
 
-logger.add("/app/logs/create_dimension_set_members.log", rotation="1 MB", retention="7 days")
+# Configure logging with minimal approach
+logger.add("/app/logs/create_dimension_set_members.log", rotation="5 MB", retention="7 days")
 
-def get_db_conn():
-    return psycopg2.connect(**DB_CONFIG)
-
-def check_required_tables():
-    """Verify required tables exist"""
-    with get_db_conn() as conn:
-        cur = conn.cursor()
-        
-        required_tables = [
-            ('processing', 'processed_members'),
-            ('processing', 'processed_dimensions'),
-            ('processing', 'dimension_set_members')
-        ]
-        
-        for schema, table_name in required_tables:
+def validate_prerequisites():
+    """Validate that prerequisite tables exist and have data"""
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            # Check processed_members table
             cur.execute("""
                 SELECT EXISTS (
                     SELECT FROM information_schema.tables 
-                    WHERE table_schema = %s AND table_name = %s
+                    WHERE table_schema = 'processing' AND table_name = 'processed_members'
                 )
-            """, (schema, table_name))
-            
+            """)
             if not cur.fetchone()[0]:
-                raise Exception(
-                    f"❌ Required table {schema}.{table_name} does not exist! "
-                    "Please run the DDL script to create it first."
+                raise Exception("❌ Source table processing.processed_members does not exist")
+            
+            cur.execute("SELECT COUNT(*) FROM processing.processed_members")
+            member_count = cur.fetchone()[0]
+            if member_count == 0:
+                raise Exception("❌ No processed members found - run script 10 first")
+            
+            # Check processed_dimensions table
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_schema = 'processing' AND table_name = 'processed_dimensions'
                 )
-        
-        logger.info("✅ All required tables exist")
+            """)
+            if not cur.fetchone()[0]:
+                raise Exception("❌ Source table processing.processed_dimensions does not exist")
+            
+            cur.execute("SELECT COUNT(*) FROM processing.processed_dimensions")
+            dimension_count = cur.fetchone()[0]
+            if dimension_count == 0:
+                raise Exception("❌ No processed dimensions found - run script 11 first")
+            
+            # Check target table
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_schema = 'processing' AND table_name = 'dimension_set_members'
+                )
+            """)
+            if not cur.fetchone()[0]:
+                raise Exception("❌ Target table processing.dimension_set_members does not exist")
+            
+            return member_count, dimension_count
 
 def populate_dimension_hashes():
     """Populate dimension_hash in processed_members from processed_dimensions"""
-    logger.info("🔗 Populating dimension hashes in processed_members...")
-    
-    with get_db_conn() as conn:
-        cur = conn.cursor()
-        
-        # Update processed_members with dimension_hash from processed_dimensions
-        cur.execute("""
-            UPDATE processing.processed_members 
-            SET dimension_hash = pd.dimension_hash
-            FROM processing.processed_dimensions pd
-            WHERE processing.processed_members.productid = pd.productid
-            AND processing.processed_members.dimension_position = pd.dimension_position
-        """)
-        
-        updated_rows = cur.rowcount
-        conn.commit()
-        
-        logger.success(f"✅ Updated {updated_rows:,} member records with dimension hashes")
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            # Update processed_members with dimension_hash from processed_dimensions
+            cur.execute("""
+                UPDATE processing.processed_members 
+                SET dimension_hash = pd.dimension_hash
+                FROM processing.processed_dimensions pd
+                WHERE processing.processed_members.productid = pd.productid
+                  AND processing.processed_members.dimension_position = pd.dimension_position
+                  AND processing.processed_members.dimension_hash IS NULL
+            """)
+            
+            updated_rows = cur.rowcount
+            conn.commit()
+            
+            return updated_rows
 
-def create_dimension_set_members():
-    """Create canonical member definitions for each dimension"""
-    logger.info("🚀 Starting dimension set members creation...")
-    
-    check_required_tables()
-    
-    # First populate dimension hashes
-    populate_dimension_hashes()
-    
-    with get_db_conn() as conn:
-        # Load processed members with dimension hashes
-        logger.info("📥 Loading processed members with dimension hashes...")
-        
-        members_with_dimensions = pd.read_sql("""
-            SELECT 
-                dimension_hash,
-                member_id,
-                member_name_en,
-                member_name_fr,
-                parent_member_id,
-                member_uom_code
-            FROM processing.processed_members
-            WHERE dimension_hash IS NOT NULL
-        """, conn)
-        
-        logger.info(f"📊 Processing {len(members_with_dimensions)} member instances")
-        
-        # Group by dimension_hash and member_id to create canonical definitions
-        logger.info("🔨 Creating canonical member definitions...")
-        
-        def select_canonical_member_attributes(group):
-            """Select most common member attributes within a dimension"""
-            # Count frequency of each English name
-            en_counts = group['member_name_en'].value_counts()
-            most_common_en = en_counts.index[0] if len(en_counts) > 0 else None
+def build_canonical_members():
+    """Build canonical member definitions using efficient PostgreSQL window functions"""
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            # Clear existing canonical members
+            cur.execute("TRUNCATE TABLE processing.dimension_set_members")
             
-            # Count frequency of each French name
-            fr_counts = group['member_name_fr'].value_counts()
-            most_common_fr = fr_counts.index[0] if len(fr_counts) > 0 else None
+            # Step 1: Create temporary table with ranked attributes for efficient mode calculation
+            cur.execute("""
+                CREATE TEMP TABLE member_rankings AS
+                WITH member_attributes AS (
+                    SELECT 
+                        dimension_hash,
+                        member_id,
+                        member_name_en,
+                        member_name_fr,
+                        parent_member_id,
+                        member_uom_code,
+                        COUNT(*) as attr_count
+                    FROM processing.processed_members
+                    WHERE dimension_hash IS NOT NULL
+                    GROUP BY dimension_hash, member_id, member_name_en, member_name_fr, 
+                             parent_member_id, member_uom_code
+                ),
+                ranked_names_en AS (
+                    SELECT 
+                        dimension_hash, member_id, member_name_en,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY dimension_hash, member_id 
+                            ORDER BY SUM(attr_count) DESC, member_name_en
+                        ) as rank_en
+                    FROM member_attributes
+                    WHERE member_name_en IS NOT NULL
+                    GROUP BY dimension_hash, member_id, member_name_en
+                ),
+                ranked_names_fr AS (
+                    SELECT 
+                        dimension_hash, member_id, member_name_fr,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY dimension_hash, member_id 
+                            ORDER BY SUM(attr_count) DESC, member_name_fr
+                        ) as rank_fr
+                    FROM member_attributes
+                    WHERE member_name_fr IS NOT NULL
+                    GROUP BY dimension_hash, member_id, member_name_fr
+                ),
+                ranked_parents AS (
+                    SELECT 
+                        dimension_hash, member_id, parent_member_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY dimension_hash, member_id 
+                            ORDER BY SUM(attr_count) DESC, parent_member_id NULLS LAST
+                        ) as rank_parent
+                    FROM member_attributes
+                    GROUP BY dimension_hash, member_id, parent_member_id
+                ),
+                ranked_uom AS (
+                    SELECT 
+                        dimension_hash, member_id, member_uom_code,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY dimension_hash, member_id 
+                            ORDER BY SUM(attr_count) DESC, member_uom_code NULLS LAST
+                        ) as rank_uom
+                    FROM member_attributes
+                    GROUP BY dimension_hash, member_id, member_uom_code
+                )
+                SELECT 
+                    ma.dimension_hash,
+                    ma.member_id,
+                    ren.member_name_en,
+                    rfr.member_name_fr,
+                    rp.parent_member_id,
+                    ru.member_uom_code,
+                    SUM(ma.attr_count) as usage_count
+                FROM member_attributes ma
+                LEFT JOIN ranked_names_en ren ON ma.dimension_hash = ren.dimension_hash 
+                    AND ma.member_id = ren.member_id AND ren.rank_en = 1
+                LEFT JOIN ranked_names_fr rfr ON ma.dimension_hash = rfr.dimension_hash 
+                    AND ma.member_id = rfr.member_id AND rfr.rank_fr = 1
+                LEFT JOIN ranked_parents rp ON ma.dimension_hash = rp.dimension_hash 
+                    AND ma.member_id = rp.member_id AND rp.rank_parent = 1
+                LEFT JOIN ranked_uom ru ON ma.dimension_hash = ru.dimension_hash 
+                    AND ma.member_id = ru.member_id AND ru.rank_uom = 1
+                GROUP BY ma.dimension_hash, ma.member_id, ren.member_name_en, 
+                         rfr.member_name_fr, rp.parent_member_id, ru.member_uom_code
+            """)
             
-            # For parent_member_id and member_uom_code, take the most common non-null value
-            parent_counts = group['parent_member_id'].value_counts(dropna=False)
-            most_common_parent = parent_counts.index[0] if len(parent_counts) > 0 else None
-            
-            uom_counts = group['member_uom_code'].value_counts(dropna=False)
-            most_common_uom = uom_counts.index[0] if len(uom_counts) > 0 else None
-            
-            # Count usage across cube instances
-            usage_count = len(group)
-            
-            return pd.Series({
-                'member_name_en': most_common_en,
-                'member_name_fr': most_common_fr,
-                'parent_member_id': most_common_parent if pd.notna(most_common_parent) else None,
-                'member_uom_code': most_common_uom if pd.notna(most_common_uom) else None,
-                'usage_count': usage_count
-            })
-        
-        # Create canonical member definitions
-        canonical_members = (
-            members_with_dimensions.groupby(['dimension_hash', 'member_id'])
-            .apply(select_canonical_member_attributes, include_groups=False)
-            .reset_index()
-        )
-        
-        logger.info(f"📈 Created {len(canonical_members)} canonical member definitions")
-        
-        # Store canonical member definitions
-        logger.info("💾 Storing canonical member definitions...")
-        cur = conn.cursor()
-        
-        # Clear existing data
-        cur.execute("TRUNCATE TABLE processing.dimension_set_members")
-        
-        # Insert canonical member definitions
-        for _, row in canonical_members.iterrows():
+            # Step 2: Insert canonical members from temp table
             cur.execute("""
                 INSERT INTO processing.dimension_set_members (
                     dimension_hash, member_id, member_name_en, member_name_fr,
                     parent_member_id, member_uom_code, usage_count
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (
-                row['dimension_hash'],
-                int(row['member_id']),
-                row['member_name_en'],
-                row['member_name_fr'],
-                int(row['parent_member_id']) if pd.notna(row['parent_member_id']) else None,
-                row['member_uom_code'],
-                int(row['usage_count'])
-            ))
-        
-        conn.commit()
-        logger.success(f"✅ Stored {len(canonical_members)} canonical member definitions")
-
-def generate_summary_stats():
-    """Generate and log summary statistics"""
-    logger.info("📊 Generating member statistics...")
-    
-    with get_db_conn() as conn:
-        # Total canonical members
-        result = pd.read_sql("SELECT COUNT(*) as count FROM processing.dimension_set_members", conn)
-        total_members = result.iloc[0]['count']
-        
-        # Members per dimension statistics
-        result = pd.read_sql("""
-            SELECT 
-                COUNT(*) as member_count,
-                dimension_hash
-            FROM processing.dimension_set_members 
-            GROUP BY dimension_hash 
-            ORDER BY member_count DESC 
-            LIMIT 5
-        """, conn)
-        
-        # Most used members
-        top_members = pd.read_sql("""
-            SELECT member_name_en, usage_count 
-            FROM processing.dimension_set_members 
-            ORDER BY usage_count DESC 
-            LIMIT 5
-        """, conn)
-        
-        logger.success(f"📈 Member Summary:")
-        logger.success(f"   • {total_members:,} canonical members across all dimensions")
-        
-        logger.info("🏆 Top 5 largest dimensions (by member count):")
-        for _, dim in result.iterrows():
-            logger.info(f"   • {dim['dimension_hash']}: {dim['member_count']:,} members")
+                )
+                SELECT 
+                    dimension_hash, member_id, member_name_en, member_name_fr,
+                    parent_member_id, member_uom_code, usage_count
+                FROM member_rankings
+                ORDER BY dimension_hash, member_id
+            """)
             
-        logger.info("🏆 Top 5 most used members:")
-        for _, member in top_members.iterrows():
-            logger.info(f"   • {member['member_name_en']}: {member['usage_count']:,} uses")
+            canonical_count = cur.rowcount
+            conn.commit()
+            
+            return canonical_count
+
+def validate_results():
+    """Validate canonical member creation and generate statistics"""
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            # Basic counts
+            cur.execute("SELECT COUNT(*) FROM processing.dimension_set_members")
+            total_members = cur.fetchone()[0]
+            
+            cur.execute("SELECT COUNT(DISTINCT dimension_hash) FROM processing.dimension_set_members")
+            unique_dimensions = cur.fetchone()[0]
+            
+            # Data quality checks
+            cur.execute("""
+                SELECT 
+                    COUNT(*) FILTER (WHERE member_name_en IS NULL AND member_name_fr IS NULL) as no_names,
+                    COUNT(*) FILTER (WHERE parent_member_id IS NOT NULL) as with_parents,
+                    COUNT(*) FILTER (WHERE member_uom_code IS NOT NULL) as with_uom,
+                    COUNT(*) FILTER (WHERE usage_count = 0) as zero_usage,
+                    MAX(usage_count) as max_usage,
+                    AVG(usage_count) as avg_usage
+                FROM processing.dimension_set_members
+            """)
+            no_names, with_parents, with_uom, zero_usage, max_usage, avg_usage = cur.fetchone()
+            
+            # Calculate hierarchy coverage
+            hierarchy_rate = (with_parents / total_members * 100) if total_members > 0 else 0
+            
+            # Get largest dimensions
+            cur.execute("""
+                SELECT dimension_hash, COUNT(*) as member_count
+                FROM processing.dimension_set_members 
+                GROUP BY dimension_hash 
+                ORDER BY member_count DESC 
+                LIMIT 5
+            """)
+            largest_dimensions = cur.fetchall()
+            
+            # Get most used members
+            cur.execute("""
+                SELECT member_name_en, usage_count 
+                FROM processing.dimension_set_members 
+                WHERE member_name_en IS NOT NULL
+                ORDER BY usage_count DESC 
+                LIMIT 5
+            """)
+            top_members = cur.fetchall()
+            
+            return {
+                'total_members': total_members,
+                'unique_dimensions': unique_dimensions,
+                'no_names': no_names,
+                'with_parents': with_parents,
+                'with_uom': with_uom,
+                'zero_usage': zero_usage,
+                'max_usage': max_usage,
+                'avg_usage': float(avg_usage) if avg_usage else 0,
+                'hierarchy_rate': hierarchy_rate,
+                'largest_dimensions': largest_dimensions,
+                'top_members': top_members
+            }
 
 def main():
-    """Main member definition creation function"""
+    """Main canonical member creation function"""
+    logger.info("🚀 Starting dimension set members creation...")
+    
     try:
-        # Create canonical member definitions
-        create_dimension_set_members()
+        # Validate prerequisites
+        member_count, dimension_count = validate_prerequisites()
+        logger.info(f"📊 Processing {member_count:,} member instances across {dimension_count:,} dimensions...")
         
-        # Generate summary
-        generate_summary_stats()
+        # Populate dimension hashes in processed_members
+        updated_rows = populate_dimension_hashes()
+        if updated_rows > 0:
+            logger.info(f"📈 Updated {updated_rows:,} member records with dimension hashes")
         
-        logger.success("🎉 Dimension set members creation complete!")
+        # Build canonical members
+        canonical_count = build_canonical_members()
+        
+        # Validate results
+        results = validate_results()
+        
+        # Final summary
+        logger.success(f"✅ Member creation complete: {results['total_members']:,} canonical members across {results['unique_dimensions']:,} dimensions")
+        
+        # Warn about concerning issues
+        if results['no_names'] > 0:
+            logger.warning(f"⚠️ {results['no_names']} members missing both English and French names")
+        
+        if results['zero_usage'] > 0:
+            logger.warning(f"⚠️ {results['zero_usage']} members with zero usage count")
+        
+        # Check if we have reasonable hierarchy coverage
+        if results['hierarchy_rate'] < 10:
+            logger.warning(f"⚠️ Low hierarchy coverage: {results['hierarchy_rate']:.1f}% - check parent relationships")
         
     except Exception as e:
         logger.exception(f"❌ Member creation failed: {e}")
