@@ -7,6 +7,9 @@ Author: Paul Verbrugge with Claude 4 Sonnet (Anthropic)
 
 Generate documentation of project structure for development reference.
 Excludes sensitive files and focuses on publicly shareable structure.
+
+Usage from host:
+docker exec etl-etl-run-964243bd83cf python /app/statcan/documentation/generate_project_structure.py
 """
 
 import os
@@ -14,7 +17,7 @@ import json
 from pathlib import Path
 from datetime import datetime
 
-# Files/directories to exclude for security
+# Files/directories to exclude for security and brevity
 EXCLUDE_PATTERNS = [
     '__pycache__',
     '.pyc',
@@ -27,7 +30,10 @@ EXCLUDE_PATTERNS = [
     'staging',
     'warehouse',
     'postgres',  # Database files
-    'backups'
+    'backups',
+    'complete_schema.sql',  # Huge generated file
+    'project_structure.json',  # Avoid recursion
+    'project_structure.txt'   # Avoid recursion
 ]
 
 # File extensions to include content for
@@ -53,10 +59,11 @@ def get_file_info(file_path):
 
 def should_include_content(file_path):
     """Determine if file content should be included"""
-    return (file_path.suffix.lower() in INCLUDE_CONTENT_EXTENSIONS and 
-            file_path.stat().st_size < 50000)  # Max 50KB files
+    # Only include content for small config/documentation files
+    return (file_path.suffix.lower() in ['.md', '.txt'] and 
+            file_path.stat().st_size < 2000)  # Max 2KB files only
 
-def scan_directory(base_path, max_depth=3, current_depth=0):
+def scan_directory(base_path, max_depth=2, current_depth=0):
     """Recursively scan directory structure"""
     if current_depth > max_depth:
         return {}
@@ -116,16 +123,13 @@ def main():
     # Base paths to scan (from ETL container perspective)
     scan_paths = [
         Path('/app/statcan'),
-        Path('/app/db/statcan_schema') if Path('/app/db/statcan_schema').exists() else None
+        # Note: DB container structure documented separately via ddl.sh
     ]
-    
-    # Remove None values
-    scan_paths = [p for p in scan_paths if p and p.exists()]
     
     documentation = {
         'generated_at': datetime.now().isoformat(),
         'generator': 'ETL Container Structure Scanner',
-        'note': 'Sensitive files and large data directories excluded',
+        'note': 'Sensitive files and large data directories excluded. DB schema documented via ddl.sh',
         'structures': {}
     }
     
@@ -135,7 +139,7 @@ def main():
         documentation['structures'][str(base_path)] = structure
     
     # Output both JSON and tree formats
-    output_dir = Path('.')  # Current directory (documentation folder)
+    output_dir = Path('/app/statcan/documentation')  # Back to absolute path since running via docker exec
     
     # JSON format for programmatic use
     json_file = output_dir / 'project_structure.json'

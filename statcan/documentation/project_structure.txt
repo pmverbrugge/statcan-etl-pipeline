@@ -1,9 +1,8 @@
-Project Structure - Generated 2025-06-21 03:45:10
+Project Structure - Generated 2025-06-21 04:17:37
 ============================================================
 
 /app/statcan/
 ├── documentation
-│   ├── complete_schema.sql
 │   ├── ddl.sh
 │   └── generate_project_structure.py
 ├── scripts
