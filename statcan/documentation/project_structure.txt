@@ -1,8 +1,9 @@
-Project Structure - Generated 2025-06-21 04:17:37
+Project Structure - Generated 2025-06-21 17:37:22
 ============================================================
 
 /app/statcan/
 ├── documentation
+│   ├── AI_assistant_coding_guidelines.txt
 │   ├── ddl.sh
 │   └── generate_project_structure.py
 ├── scripts
@@ -18,12 +19,7 @@ Project Structure - Generated 2025-06-21 04:17:37
 │   ├── 12_create_dimension_set.py
 │   ├── 13_create_dimension_set_members.py
 │   ├── 14_add_dimension_metadata_flags.py
-│   ├── 15_calculate_tree_levels.py
-│   ├── 16_populate_cube_dimension_registry.py
-│   ├── README.md
-│   ├── dev_ingest_cube.py
-│   ├── ingest_cube_csv.py
-│   └── sample.txt
+│   └── 15_calculate_tree_levels.py
 └── tools
     ├── __init__.py
     └── file_logger.py
