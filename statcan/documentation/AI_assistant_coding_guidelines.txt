@@ -97,64 +97,143 @@ df['normalized'] = df['source'].str.lower().str.strip()
 df['hash'] = df.apply(lambda x: hash_function(x), axis=1)
 ```
 
-### Error Handling and Logging
+## Minimal Logging Guidelines
 
-#### Logging Standards
+### Philosophy
+ETL scripts should log **only what operators need to know** - major milestones, failures, and actionable warnings. Excessive logging creates noise, impacts performance, and makes it harder to identify real issues.
+
+### Core Logging Principles
+
+#### 1. **Major Milestones Only**
+Log significant process boundaries and completion states:
+```python
+logger.info("🚀 Starting dimension metadata ingestion...")
+logger.info("📊 Processing 1,247 metadata files...")
+logger.success("✅ Metadata ingestion complete: 1,235 processed, 12 failed")
+```
+
+#### 2. **Always Log Failures**
+Every error should be logged with sufficient context for debugging:
+```python
+logger.error(f"❌ Failed to process product {productid}: {str(e)}")
+logger.exception(f"❌ Database connection failed: {e}")  # Includes stack trace
+```
+
+#### 3. **Progress Only for Long Operations**
+For processes taking >30 seconds, log progress at reasonable intervals:
+```python
+# Log every 1000 items OR every 30 seconds, whichever is less frequent
+if processed_count % 1000 == 0:
+    logger.info(f"📈 Progress: {processed_count:,}/{total_count:,} processed")
+```
+
+#### 4. **Actionable Warnings Only**
+Only warn about issues that require operator attention:
+```python
+# ✅ Good - actionable
+logger.warning(f"⚠️ High failure rate: {failure_rate:.1f}% - check API connectivity")
+
+# ❌ Avoid - not actionable
+logger.warning(f"⚠️ Product {productid} has no French title")
+```
+
+### What NOT to Log
+
+#### Avoid These Common Over-Logging Patterns:
+- **Individual record processing**: Don't log each file/record processed
+- **Successful validation steps**: Only log validation failures
+- **Debug information**: No function entry/exit logging
+- **Data content details**: Don't log specific field values
+- **Batch details**: Don't log each batch unless it fails
+
+```python
+# ❌ EXCESSIVE - Don't do this
+logger.info(f"📥 Processing file {filename}")
+logger.debug(f"🔍 Validating product {productid}")
+logger.info(f"📦 Processing batch {batch_num}/{total_batches}")
+logger.debug(f"✅ Validated {productid}: {validation_result}")
+logger.info(f"💾 Inserted {record_count} records for {productid}")
+```
+
+### Standard Logging Configuration
 ```python
 from loguru import logger
 
-# Configure with rotation and emoji indicators
-logger.add("/app/logs/script_name.log", rotation="10 MB", retention="7 days")
-
-# Use consistent emoji patterns
-logger.info("🚀 Starting processing...")           # Start operations
-logger.info("📥 Loading data...")                 # Data loading
-logger.info("🔨 Processing...")                   # Core processing
-logger.info("💾 Storing results...")              # Data storage
-logger.success("✅ Processing complete!")         # Success
-logger.warning("⚠️ Data quality issue...")        # Warnings
-logger.error("❌ Processing failed...")            # Errors
-logger.info("🔍 Validating...")                   # Validation
-logger.info("📊 Statistics...")                   # Reporting
+# Configure with appropriate rotation for minimal logging
+logger.add("/app/logs/script_name.log", rotation="5 MB", retention="7 days")
 ```
 
-#### Error Handling Patterns
+### Emoji Standards for Logging
+Use these sparingly and consistently:
+- 🚀 **Process start**
+- ✅ **Successful completion**
+- ❌ **Failures/errors**
+- ⚠️ **Actionable warnings**
+- 📊 **Major statistics**
+- 📈 **Progress (long operations only)**
+
+### Logging Template for ETL Scripts
 ```python
 def main():
+    logger.info("🚀 Starting [process name]...")
+    
     try:
-        # Validate prerequisites
-        check_required_tables()
+        # Get work to do
+        items = get_work_items()
+        logger.info(f"📊 Processing {len(items)} [items]...")
         
-        # Core processing
-        process_data()
+        # Process with minimal logging
+        results = process_items(items)
         
-        # Validate output
-        validate_results()
+        # Log final results
+        logger.success(f"✅ [Process name] complete: {results['success']} processed, {results['failed']} failed")
         
-        logger.success("🎉 Processing completed successfully!")
+        # Warn about concerning failure rates
+        if results['failed'] > 0:
+            failure_rate = results['failed'] / len(items) * 100
+            if failure_rate > 10:  # Only warn if >10% failure rate
+                logger.warning(f"⚠️ High failure rate: {failure_rate:.1f}% - investigate logs")
         
     except Exception as e:
-        logger.exception(f"❌ Processing failed: {e}")
+        logger.exception(f"❌ [Process name] failed: {e}")
         raise
 
-def check_required_tables():
-    """Validate prerequisites before processing"""
-    with psycopg2.connect(**DB_CONFIG) as conn:
-        cur = conn.cursor()
-        
-        # Check input data exists
-        cur.execute("SELECT COUNT(*) FROM input_table")
-        count = cur.fetchone()[0]
-        
-        if count == 0:
-            raise Exception("❌ No input data found! Run prerequisite script first.")
-        
-        logger.success("✅ Prerequisites validated")
+def process_items(items):
+    success_count = 0
+    failed_count = 0
+    
+    for i, item in enumerate(items):
+        try:
+            process_single_item(item)
+            success_count += 1
+            
+            # Progress logging only for long operations
+            if len(items) > 1000 and i % 1000 == 0:
+                logger.info(f"📈 Progress: {i:,}/{len(items):,} processed")
+                
+        except Exception as e:
+            # Always log individual failures
+            logger.error(f"❌ Failed to process {item.id}: {str(e)}")
+            failed_count += 1
+            continue
+    
+    return {'success': success_count, 'failed': failed_count}
 ```
 
-### Data Quality and Validation
+### Rule of Thumb for Logging
+**If you wouldn't want to see this message in a daily operational summary, don't log it.**
 
-#### Comprehensive Validation
+Focus on the information a system operator needs to:
+1. Know the process completed successfully
+2. Identify and fix failures
+3. Monitor system health
+4. Understand performance trends
+
+Everything else is just noise.
+
+## Error Handling and Validation
+
+### Comprehensive Validation
 ```python
 def validate_output():
     """Validate processed output for data quality"""
@@ -201,8 +280,8 @@ for i in range(0, len(items), BATCH_SIZE):
     batch = items[i:i + BATCH_SIZE]
     process_batch(batch)
     
-    # Progress logging
-    if i % 10000 == 0:
+    # Progress logging only if needed
+    if len(items) > 5000 and i % 5000 == 0:
         logger.info(f"📈 Progress: {i:,}/{len(items):,} items processed")
 ```
 
@@ -262,16 +341,14 @@ hash_query = """
 ```python
 def process_files_in_batches(file_list, batch_size=100):
     """Process files in batches for memory efficiency"""
+    total_batches = (len(file_list) + batch_size - 1) // batch_size
+    
     for i in range(0, len(file_list), batch_size):
         batch = file_list[i:i + batch_size]
         batch_num = (i // batch_size) + 1
-        total_batches = (len(file_list) + batch_size - 1) // batch_size
-        
-        logger.info(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch)} files)")
         
         try:
             process_file_batch(batch)
-            logger.success(f"✅ Batch {batch_num} completed")
         except Exception as e:
             logger.error(f"❌ Batch {batch_num} failed: {e}")
             continue  # Continue with next batch
@@ -300,7 +377,6 @@ def call_statcan_api(url, payload=None):
             return response.json()
             
         except requests.exceptions.Timeout:
-            logger.warning(f"⚠️ API timeout (attempt {attempt + 1}/{MAX_RETRIES})")
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RATE_LIMIT_DELAY * (attempt + 1))
         except requests.exceptions.RequestException as e:
@@ -364,6 +440,14 @@ from statcan.tools.config import DB_CONFIG
 - **Database Load**: Validate query performance on large datasets
 - **Error Rates**: Track and minimize processing failures
 
+## Monitoring Integration
+
+Scripts should be **monitorable by external tools** with minimal logs:
+- **Exit codes**: 0 for success, non-zero for failure
+- **Log patterns**: Consistent emoji patterns for automated parsing
+- **Metrics**: Key counts in final success messages
+- **Health checks**: Clear success/failure indicators
+
 ## AI Assistant Guidelines
 
 When working on this codebase:
@@ -374,6 +458,7 @@ When working on this codebase:
 4. **Document decisions**: Explain why specific approaches were chosen
 5. **Validate thoroughly**: Include comprehensive data quality checks
 6. **Think integration**: Consider how changes affect downstream processes
+7. **Log minimally**: Focus on operational necessity, not development convenience
 
 ## Common Pitfalls to Avoid
 
@@ -381,7 +466,7 @@ When working on this codebase:
 - **Pandas overuse**: Don't default to pandas for database operations
 - **Missing validation**: Always validate input data and output results
 - **Poor error handling**: Ensure graceful failure and meaningful error messages
-- **Inconsistent logging**: Use standardized emoji patterns and log levels
+- **Excessive logging**: Use standardized minimal logging patterns
 - **Ignoring constraints**: Respect container separation and DDL restrictions
 
 ## Resources
