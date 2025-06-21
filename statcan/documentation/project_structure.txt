@@ -1,0 +1,31 @@
+Project Structure - Generated 2025-06-21 03:45:10
+============================================================
+
+/app/statcan/
+├── documentation
+│   ├── complete_schema.sql
+│   ├── ddl.sh
+│   └── generate_project_structure.py
+├── scripts
+│   ├── 02_spine_load_to_db.py
+│   ├── 03_cube_status_init.py
+│   ├── 04_cube_status_update.py
+│   ├── 05_cube_download.py
+│   ├── 06_cube_verify_files.py
+│   ├── 07_metadata_status_init.py
+│   ├── 08_metadata_download.py
+│   ├── 10_process_dimension_members.py
+│   ├── 11_process_dimension.py
+│   ├── 12_create_dimension_set.py
+│   ├── 13_create_dimension_set_members.py
+│   ├── 14_add_dimension_metadata_flags.py
+│   ├── 15_calculate_tree_levels.py
+│   ├── 16_populate_cube_dimension_registry.py
+│   ├── README.md
+│   ├── dev_ingest_cube.py
+│   ├── ingest_cube_csv.py
+│   └── sample.txt
+└── tools
+    ├── __init__.py
+    └── file_logger.py
+
