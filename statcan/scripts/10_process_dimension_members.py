@@ -1,209 +1,309 @@
 #!/usr/bin/env python3
 """
-Statistics Canada Dimension Member Processing and Normalization
-==============================================================
+Statcan Public Data ETL Pipeline
+Script: 10_process_dimension_members.py
+Date: 2025-06-21
+Author: Paul Verbrugge with Claude Sonnet 4 (Anthropic)
 
-Script:     10_process_dimension_members.py
-Purpose:    Process and normalize raw dimension members with hash-based deduplication
-Author:     Paul Verbrugge with Claude Sonnet 4 (Anthropic)
-Created:    2025
-Updated:    June 2025
+Process and normalize raw dimension members with hash-based deduplication for registry building.
 
-Overview:
---------
-This script processes raw dimension members from Statistics Canada metadata,
-creating normalized, hash-based identifiers for deduplication and harmonization.
-It generates member-level hashes and dimension-level hashes for the registry system.
-
-Key Changes:
-- Updated to read from processing.raw_member (instead of dictionary.raw_member)
-- Enhanced error handling and validation
-- TimescaleDB optimization support
-
-The output feeds into 11_process_dimension.py for final registry construction.
+This script transforms raw member data from Statistics Canada metadata into normalized,
+hash-based identifiers for cross-cube deduplication and harmonization. It generates
+consistent member-level hashes based on structural identity (ID, label, parent, UOM)
+while preserving all original metadata for downstream processing.
 
 Key Operations:
---------------
-• Hash generation for member identity (code + label + parent + UOM)
-• Dimension-level hash creation from sorted member hashes
-• Label normalization and most-common selection
-• Metadata flag computation (is_total, etc.)
-• Results stored in processing.processed_members table
+- Generate deterministic member hashes from core identity attributes
+- Normalize labels for consistent processing across languages
+- Validate data types and handle edge cases (integer overflow, null values)
+- Store processed member data with computed hashes for registry building
+- Comprehensive data quality validation and statistics
 
-Processing Pipeline:
--------------------
-1. Load raw_member and raw_dimension data FROM PROCESSING SCHEMA
-2. Generate member_hash for each unique code-label-parent-UOM combination
-3. Create dimension_hash by aggregating member hashes per dimension
-4. Select most common English/French labels for each member
-5. Compute metadata flags (is_total based on label content)
-6. Store processed results for registry building stage
+Processing Logic:
+1. Load raw member data from processing.raw_member (populated by script 09)
+2. Apply minimal label normalization (lowercase, trim) for hash consistency
+3. Generate member_hash from (member_id, label_en, parent_id, uom_code)
+4. Validate data types and handle PostgreSQL integer range constraints
+5. Insert processed data using PostgreSQL-first approach with conflict resolution
+6. Generate deduplication statistics and data quality metrics
+
+Dependencies:
+- Requires processing.raw_member table from 09_dimension_raw_load.py
+- Uses processing.processed_members table for output storage
+- Feeds into 11_process_dimension.py for dimension-level hash generation
 """
 
 import hashlib
-import pandas as pd
 import psycopg2
 from loguru import logger
 from statcan.tools.config import DB_CONFIG
 
-logger.add("/app/logs/process_dimension_members.log", rotation="1 MB", retention="7 days")
+# Configure logging with minimal approach
+logger.add("/app/logs/process_dimension_members.log", rotation="5 MB", retention="7 days")
 
-def normalize(text):
-    """Normalize text for consistent hashing"""
+# Processing constants
+BATCH_SIZE = 10000  # Process records in batches for memory efficiency
+PG_INT_MIN = -2147483648  # PostgreSQL integer range constraints
+PG_INT_MAX = 2147483647
+
+def normalize_text(text):
+    """Normalize text for consistent hashing across different inputs"""
     return str(text or "").strip().lower()
 
 def hash_member_identity(member_id, label_en, parent_id=None, uom_code=None):
-    """Create deterministic hash for member identity based on key attributes
+    """Generate deterministic hash for member identity
     
-    Core member identity based on:
+    Creates 12-character hash based on core structural identity:
     - member_id: Core member identifier
     - label_en: Normalized English label 
     - parent_id: Hierarchical parent relationship
     - uom_code: Unit of measure code
     
-    Note: Excludes classification_code, classification_type_code, geo_level,
-    vintage, and terminated from hash to focus on structural identity.
+    Excludes classification codes, geo_level, vintage, terminated to focus
+    on structural identity for cross-cube harmonization.
     """
-    key = f"{normalize(member_id)}|{normalize(label_en)}|{normalize(parent_id)}|{normalize(uom_code)}"
+    key_components = [
+        normalize_text(member_id),
+        normalize_text(label_en), 
+        normalize_text(parent_id),
+        normalize_text(uom_code)
+    ]
+    key = "|".join(key_components)
     full_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    # Truncate to 12 characters for display convenience
-    # Collision probability ~0.001% for 300k members
-    return full_hash[:12]
+    return full_hash[:12]  # 12-char truncation for practical use
 
-def hash_dimension_identity(member_hashes):
-    """Create deterministic hash for dimension based on sorted member hashes"""
-    sorted_hashes = sorted(member_hashes)
-    full_hash = hashlib.sha256("|".join(sorted_hashes).encode("utf-8")).hexdigest()
-    # Truncate to 12 characters for display convenience  
-    # Collision probability ~0.0003% for 100k dimensions
-    return full_hash[:12]
-
-def get_db_conn():
-    return psycopg2.connect(**DB_CONFIG)
-
-def check_required_tables():
-    """Verify required tables exist"""
-    with get_db_conn() as conn:
-        cur = conn.cursor()
+def validate_integer_ranges(cur):
+    """Check for integer values that exceed PostgreSQL constraints"""
+    int_columns = [
+        'productid', 'dimension_position', 'member_id', 
+        'parent_member_id', 'geo_level', 'vintage'
+    ]
+    
+    overflow_issues = []
+    
+    for col in int_columns:
+        cur.execute(f"""
+            SELECT 
+                COUNT(*) FILTER (WHERE {col} > %s) as over_max,
+                COUNT(*) FILTER (WHERE {col} < %s) as under_min,
+                MAX({col}) as max_val,
+                MIN({col}) as min_val
+            FROM processing.raw_member
+            WHERE {col} IS NOT NULL
+        """, (PG_INT_MAX, PG_INT_MIN))
         
-        required_tables = [
-            ('processing', 'raw_member'),
-            ('processing', 'processed_members')
-        ]
+        over_max, under_min, max_val, min_val = cur.fetchone()
         
-        for schema, table_name in required_tables:
+        if over_max > 0 or under_min > 0:
+            overflow_issues.append({
+                'column': col,
+                'over_max': over_max,
+                'under_min': under_min,
+                'range': f"{min_val} to {max_val}"
+            })
+    
+    return overflow_issues
+
+def get_raw_member_data():
+    """Load raw member data with validation"""
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            # Verify source table exists and has data
             cur.execute("""
                 SELECT EXISTS (
                     SELECT FROM information_schema.tables 
-                    WHERE table_schema = %s AND table_name = %s
+                    WHERE table_schema = 'processing' AND table_name = 'raw_member'
                 )
-            """, (schema, table_name))
-            
+            """)
             if not cur.fetchone()[0]:
-                raise Exception(
-                    f"❌ Required table {schema}.{table_name} does not exist! "
-                    "Please run the DDL script to create it first."
-                )
-        
-        logger.info("✅ All required tables exist")
+                raise Exception("❌ Source table processing.raw_member does not exist")
+            
+            cur.execute("SELECT COUNT(*) FROM processing.raw_member")
+            record_count = cur.fetchone()[0]
+            
+            if record_count == 0:
+                raise Exception("❌ No raw member data found - run script 09 first")
+            
+            # Check for integer overflow issues
+            overflow_issues = validate_integer_ranges(cur)
+            if overflow_issues:
+                for issue in overflow_issues:
+                    logger.warning(f"⚠️ Integer range issues in {issue['column']}: {issue['over_max']} over max, {issue['under_min']} under min")
+            
+            # Load data with PostgreSQL processing
+            cur.execute("""
+                SELECT 
+                    productid, dimension_position, member_id,
+                    member_name_en, member_name_fr,
+                    parent_member_id, member_uom_code,
+                    classification_code, classification_type_code,
+                    geo_level, vintage, terminated
+                FROM processing.raw_member
+                ORDER BY productid, dimension_position, member_id
+            """)
+            
+            return cur.fetchall(), record_count
 
-def process_members():
-    """Main member processing function - creates member-level hashes only"""
-    logger.info("🚀 Starting dimension member processing...")
+def process_member_batch(cur, batch_data, batch_num, total_batches):
+    """Process a batch of member records with hash generation"""
     
-    check_required_tables()
+    processed_count = 0
+    invalid_count = 0
     
-    with get_db_conn() as conn:
-        # Load raw member data FROM PROCESSING SCHEMA
-        logger.info("📥 Loading raw member data from processing schema...")
-        raw_member = pd.read_sql("SELECT * FROM processing.raw_member", conn)
+    for row in batch_data:
+        (productid, dimension_position, member_id, member_name_en, member_name_fr,
+         parent_member_id, member_uom_code, classification_code, 
+         classification_type_code, geo_level, vintage, terminated) = row
         
-        logger.info(f"📊 Processing {len(raw_member)} raw member records")
+        # Skip records with missing essential data
+        if productid is None or dimension_position is None or member_id is None:
+            invalid_count += 1
+            continue
         
-        # Step 1: Minimal label normalization
-        logger.info("🔨 Applying minimal label normalization...")
-        raw_member["member_name_en_norm"] = raw_member["member_name_en"].apply(normalize)
-        raw_member["member_name_fr_norm"] = raw_member["member_name_fr"].apply(normalize)
+        # Generate normalized labels and hash
+        member_name_en_norm = normalize_text(member_name_en)
+        member_name_fr_norm = normalize_text(member_name_fr)
         
-        # Step 2: Generate member-level hashes
-        logger.info("🔨 Generating member identity hashes...")
-        raw_member["member_hash"] = raw_member.apply(
-            lambda row: hash_member_identity(
-                row["member_id"],
-                row["member_name_en_norm"],
-                row["parent_member_id"],
-                row["member_uom_code"]
-            ), axis=1
+        member_hash = hash_member_identity(
+            member_id, member_name_en_norm, parent_member_id, member_uom_code
         )
         
-        # Step 3: Store all member data with hashes
-        logger.info("💾 Storing processed member data...")
+        # Convert terminated to boolean
+        terminated_bool = bool(terminated) if terminated is not None else False
         
-        # Prepare data for insertion - keep ALL original fields plus computed hash
-        processed_data = raw_member[[
-            "productid", "dimension_position", "member_id", "member_hash",
-            "member_name_en", "member_name_fr", "member_name_en_norm", "member_name_fr_norm",
-            "parent_member_id", "member_uom_code", "classification_code", 
-            "classification_type_code", "geo_level", "vintage", "terminated"
-        ]].copy()
+        # Insert with conflict resolution
+        cur.execute("""
+            INSERT INTO processing.processed_members (
+                productid, dimension_position, member_id, member_hash,
+                member_name_en, member_name_fr, parent_member_id, member_uom_code,
+                classification_code, classification_type_code, geo_level, vintage,
+                terminated, member_label_norm
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (productid, dimension_position, member_id) DO UPDATE SET
+                member_hash = EXCLUDED.member_hash,
+                member_name_en = EXCLUDED.member_name_en,
+                member_name_fr = EXCLUDED.member_name_fr,
+                member_label_norm = EXCLUDED.member_label_norm
+        """, (
+            productid, dimension_position, member_id, member_hash,
+            member_name_en, member_name_fr, parent_member_id, member_uom_code,
+            classification_code, classification_type_code, geo_level, vintage,
+            terminated_bool, member_name_en_norm
+        ))
         
-        # Convert integer boolean to proper boolean
-        processed_data["terminated"] = processed_data["terminated"].astype(bool)
-        
-        # Debug: Check for large integer values that might cause overflow
-        logger.info("🔍 Checking for integer overflow issues...")
-        for col in ["productid", "dimension_position", "member_id", "parent_member_id", "geo_level", "vintage"]:
-            if col in processed_data.columns:
-                max_val = processed_data[col].max()
-                min_val = processed_data[col].min()
-                logger.info(f"   {col}: min={min_val}, max={max_val}")
-                
-                # PostgreSQL integer range is -2,147,483,648 to 2,147,483,647
-                if pd.notna(max_val) and max_val > 2147483647:
-                    logger.warning(f"⚠️ {col} has values exceeding integer range: {max_val}")
-                if pd.notna(min_val) and min_val < -2147483648:
-                    logger.warning(f"⚠️ {col} has values below integer range: {min_val}")
-        
-        # Insert into processing table
-        cur = conn.cursor()
-        
-        # Clear existing data for fresh processing
-        cur.execute("TRUNCATE TABLE processing.processed_members")
-        
-        for _, row in processed_data.iterrows():
+        processed_count += 1
+    
+    return processed_count, invalid_count
+
+def validate_processed_results():
+    """Validate processing results and generate statistics"""
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            # Basic counts
+            cur.execute("SELECT COUNT(*) FROM processing.processed_members")
+            total_processed = cur.fetchone()[0]
+            
+            cur.execute("SELECT COUNT(DISTINCT member_hash) FROM processing.processed_members")
+            unique_hashes = cur.fetchone()[0]
+            
+            # Data quality checks
             cur.execute("""
-                INSERT INTO processing.processed_members (
-                    productid, dimension_position, member_id, member_hash,
-                    member_name_en, member_name_fr, parent_member_id, member_uom_code,
-                    classification_code, classification_type_code, geo_level, vintage,
-                    terminated, member_label_norm
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                int(row["productid"]) if pd.notna(row["productid"]) else None,
-                int(row["dimension_position"]) if pd.notna(row["dimension_position"]) else None,
-                int(row["member_id"]) if pd.notna(row["member_id"]) else None,
-                row["member_hash"],
-                row["member_name_en"], row["member_name_fr"], 
-                int(row["parent_member_id"]) if pd.notna(row["parent_member_id"]) else None,
-                row["member_uom_code"], row["classification_code"], row["classification_type_code"],
-                int(row["geo_level"]) if pd.notna(row["geo_level"]) else None,
-                int(row["vintage"]) if pd.notna(row["vintage"]) else None,
-                row["terminated"], row["member_name_en_norm"]
-            ))
-        
-        conn.commit()
-        
-        # Summary statistics
-        unique_members = len(processed_data)
-        unique_hashes = len(processed_data["member_hash"].unique())
-        
-        logger.success(f"✅ Processed {unique_members:,} member records")
-        logger.success(f"📈 Generated {unique_hashes:,} unique member hashes")
-        logger.info("🎯 Member processing complete - ready for dimension registry building")
+                SELECT 
+                    COUNT(*) FILTER (WHERE member_hash IS NULL) as null_hashes,
+                    COUNT(*) FILTER (WHERE member_name_en IS NULL) as null_en_names,
+                    COUNT(*) FILTER (WHERE parent_member_id IS NOT NULL) as with_parents,
+                    COUNT(DISTINCT productid) as unique_products
+                FROM processing.processed_members
+            """)
+            null_hashes, null_en_names, with_parents, unique_products = cur.fetchone()
+            
+            # Calculate deduplication rate
+            dedup_rate = ((total_processed - unique_hashes) / total_processed * 100) if total_processed > 0 else 0
+            
+            # Calculate hierarchy rate
+            hierarchy_rate = (with_parents / total_processed * 100) if total_processed > 0 else 0
+            
+            return {
+                'total_processed': total_processed,
+                'unique_hashes': unique_hashes,
+                'dedup_rate': dedup_rate,
+                'hierarchy_rate': hierarchy_rate,
+                'unique_products': unique_products,
+                'null_hashes': null_hashes,
+                'null_en_names': null_en_names,
+                'with_parents': with_parents
+            }
 
 def main():
+    """Main member processing function"""
+    logger.info("🚀 Starting dimension member processing...")
+    
     try:
-        process_members()
+        # Verify target table exists
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_schema = 'processing' AND table_name = 'processed_members'
+                    )
+                """)
+                if not cur.fetchone()[0]:
+                    raise Exception("❌ Target table processing.processed_members does not exist")
+        
+        # Load raw data
+        raw_data, total_records = get_raw_member_data()
+        logger.info(f"📊 Processing {total_records:,} raw member records...")
+        
+        # Clear existing processed data
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE TABLE processing.processed_members")
+                conn.commit()
+        
+        # Process in batches
+        total_processed = 0
+        total_invalid = 0
+        total_batches = (len(raw_data) + BATCH_SIZE - 1) // BATCH_SIZE
+        
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor() as cur:
+                for i in range(0, len(raw_data), BATCH_SIZE):
+                    batch = raw_data[i:i + BATCH_SIZE]
+                    batch_num = (i // BATCH_SIZE) + 1
+                    
+                    # Progress logging for long operations
+                    if total_records > 10000 and i % 10000 == 0:
+                        logger.info(f"📈 Progress: {i:,}/{total_records:,} records processed")
+                    
+                    processed_count, invalid_count = process_member_batch(
+                        cur, batch, batch_num, total_batches
+                    )
+                    
+                    total_processed += processed_count
+                    total_invalid += invalid_count
+                
+                # Commit all changes
+                conn.commit()
+        
+        # Validate results
+        results = validate_processed_results()
+        
+        # Final summary
+        logger.success(f"✅ Member processing complete: {results['total_processed']:,} processed, {total_invalid} invalid")
+        
+        # Warn about concerning issues
+        if total_invalid > 0:
+            invalid_rate = total_invalid / (total_processed + total_invalid) * 100
+            if invalid_rate > 5:
+                logger.warning(f"⚠️ High invalid rate: {invalid_rate:.1f}% - check data quality")
+        
+        if results['null_hashes'] > 0:
+            logger.warning(f"⚠️ {results['null_hashes']} records with null hashes - hash generation failed")
+        
+        if results['null_en_names'] > 0:
+            logger.warning(f"⚠️ {results['null_en_names']} members missing English names")
+        
     except Exception as e:
         logger.exception(f"❌ Member processing failed: {e}")
         raise
