@@ -1,339 +1,289 @@
 #!/usr/bin/env python3
 """
-Statistics Canada Dimension Member Tree Level Calculator
-=======================================================
+Statcan Public Data ETL Pipeline
+Script: 15_calculate_tree_levels.py
+Date: 2025-06-21
+Author: Paul Verbrugge with Claude Sonnet 4 (Anthropic)
 
-Script:     15_calculate_tree_levels.py
-Purpose:    Calculate hierarchical tree levels for dimension members
-Author:     Paul Verbrugge with Claude Sonnet 4 (Anthropic)
-Created:    2025
-Updated:    June 2025
+Calculate hierarchical tree levels for dimension members using efficient SQL recursion.
 
-Overview:
---------
-This script calculates tree_level values for members in hierarchical dimensions:
-- Level 1: Root nodes (members with no parent_member_id)
-- Level 2: Children of level 1 nodes
-- Level 3: Children of level 2 nodes, etc.
-- NULL: Members in non-hierarchical dimensions (is_tree=false)
-
-The script includes comprehensive validation to detect and handle:
-- Circular references in parent-child relationships
-- Orphaned members (parent_member_id points to non-existent member)
-- Maximum depth limits to prevent infinite recursion
-- Self-referencing members
-
-Requires: Scripts 10-14 to have run successfully first.
+This script calculates tree_level values for members in hierarchical dimensions using
+PostgreSQL's recursive Common Table Expressions (CTEs) for optimal performance. It
+handles validation, circular reference detection, and level assignment efficiently.
 
 Key Operations:
---------------
-• Load hierarchical dimensions (is_tree=true) and their members
-• Build parent-child relationship graphs for each dimension
-• Detect and report circular references and orphaned members
-• Calculate tree levels using iterative depth-first traversal
-• Update processing.dimension_set_members with calculated levels
-• Generate comprehensive validation and summary reports
+- Clear tree_level for non-hierarchical dimensions (is_tree=false)
+- Use recursive CTEs to calculate levels efficiently in SQL
+- Detect and handle circular references and orphaned members
+- Update tree_level values using set-based operations
+- Generate comprehensive validation and summary statistics
 
-Processing Pipeline:
--------------------
-1. Load dimensions marked as hierarchical (is_tree=true)
-2. For each hierarchical dimension, load all members
-3. Build parent-child relationship mapping
-4. Validate relationships (detect cycles, orphans, self-references)
-5. Calculate tree levels iteratively starting from root nodes
-6. Update database with calculated tree_level values
-7. Generate summary statistics and validation reports
+Processing Logic:
+1. Clear tree_level for non-hierarchical dimensions
+2. Use PostgreSQL recursive CTE to calculate tree levels efficiently
+3. Detect circular references and orphaned members using SQL
+4. Update tree_level values in batch operations
+5. Validate results and generate summary statistics
+
+Dependencies:
+- Requires processing.dimension_set with is_tree flags from script 14
+- Requires processing.dimension_set_members from script 13
+- Updates tree_level column in processing.dimension_set_members
 """
 
-import pandas as pd
 import psycopg2
-from collections import defaultdict, deque
 from loguru import logger
 from statcan.tools.config import DB_CONFIG
 
-logger.add("/app/logs/calculate_tree_levels.log", rotation="1 MB", retention="7 days")
+# Configure logging with minimal approach
+logger.add("/app/logs/calculate_tree_levels.log", rotation="5 MB", retention="7 days")
 
-# Maximum tree depth constant (not used but kept for reference)
-MAX_TREE_DEPTH = 50
-
-def get_db_conn():
-    return psycopg2.connect(**DB_CONFIG)
-
-def check_required_tables():
-    """Verify required tables and columns exist"""
-    with get_db_conn() as conn:
-        cur = conn.cursor()
-        
-        # Check if tree_level column exists
-        cur.execute("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.columns 
-                WHERE table_schema = 'processing' 
-                AND table_name = 'dimension_set_members'
-                AND column_name = 'tree_level'
-            )
-        """)
-        
-        if not cur.fetchone()[0]:
-            raise Exception(
-                "❌ Column tree_level does not exist in processing.dimension_set_members! "
-                "Please run the DDL script to add this column first."
-            )
-        
-        logger.info("✅ All required tables and columns exist")
-
-def load_hierarchical_dimensions():
-    """Load dimensions that are marked as hierarchical"""
-    with get_db_conn() as conn:
-        hierarchical_dims = pd.read_sql("""
-            SELECT dimension_hash, dimension_name_en
-            FROM processing.dimension_set 
-            WHERE is_tree = true
-            ORDER BY dimension_hash
-        """, conn)
-        
-        logger.info(f"📥 Found {len(hierarchical_dims)} hierarchical dimensions")
-        return hierarchical_dims
-
-def load_dimension_members(dimension_hash):
-    """Load all members for a specific dimension"""
-    with get_db_conn() as conn:
-        members = pd.read_sql("""
-            SELECT dimension_hash, member_id, parent_member_id, member_name_en
-            FROM processing.dimension_set_members
-            WHERE dimension_hash = %s
-            ORDER BY member_id
-        """, conn, params=(dimension_hash,))
-        
-        return members
-
-def validate_member_relationships(members, dimension_hash):
-    """Validate parent-child relationships and detect issues"""
-    issues = []
-    
-    # Get all member IDs in this dimension
-    all_member_ids = set(members['member_id'])
-    
-    # Check for self-references
-    self_refs = members[members['member_id'] == members['parent_member_id']]
-    if len(self_refs) > 0:
-        for _, member in self_refs.iterrows():
-            issues.append({
-                'type': 'self_reference',
-                'dimension_hash': dimension_hash,
-                'member_id': member['member_id'],
-                'message': f"Member {member['member_id']} references itself as parent"
-            })
-    
-    # Check for orphaned members (parent_member_id points to non-existent member)
-    members_with_parents = members[members['parent_member_id'].notna()]
-    for _, member in members_with_parents.iterrows():
-        if member['parent_member_id'] not in all_member_ids:
-            issues.append({
-                'type': 'orphaned_member',
-                'dimension_hash': dimension_hash,
-                'member_id': member['member_id'],
-                'parent_member_id': member['parent_member_id'],
-                'message': f"Member {member['member_id']} has parent {member['parent_member_id']} that doesn't exist"
-            })
-    
-    return issues
-
-def detect_circular_references(members, dimension_hash):
-    """Detect circular references using path tracking"""
-    # Build parent mapping
-    parent_map = {}
-    for _, member in members.iterrows():
-        if pd.notna(member['parent_member_id']):
-            parent_map[member['member_id']] = member['parent_member_id']
-    
-    circular_refs = []
-    visited_global = set()
-    
-    def check_path_for_cycles(start_member_id):
-        """Follow parent path from a member to detect cycles"""
-        if start_member_id in visited_global:
-            return
-        
-        visited_in_path = set()
-        current_id = start_member_id
-        path = []
-        
-        while current_id is not None and current_id not in visited_global:
-            if current_id in visited_in_path:
-                # Found cycle - get the cycle portion
-                cycle_start = path.index(current_id)
-                cycle = path[cycle_start:] + [current_id]
-                circular_refs.append({
-                    'type': 'circular_reference',
-                    'dimension_hash': dimension_hash,
-                    'cycle': cycle,
-                    'message': f"Circular reference: {' -> '.join(map(str, cycle))}"
-                })
-                break
+def validate_prerequisites():
+    """Validate that prerequisite tables exist and have required columns"""
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            # Check dimension_set table with is_tree column
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.columns 
+                    WHERE table_schema = 'processing' 
+                      AND table_name = 'dimension_set'
+                      AND column_name = 'is_tree'
+                )
+            """)
+            if not cur.fetchone()[0]:
+                raise Exception("❌ Column is_tree does not exist in processing.dimension_set")
             
-            visited_in_path.add(current_id)
-            path.append(current_id)
-            current_id = parent_map.get(current_id)
-        
-        # Mark all members in this path as visited
-        visited_global.update(visited_in_path)
-    
-    # Check each member's parent path
-    for member_id in members['member_id']:
-        check_path_for_cycles(member_id)
-    
-    return circular_refs
+            # Check dimension_set_members table with tree_level column
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.columns 
+                    WHERE table_schema = 'processing' 
+                      AND table_name = 'dimension_set_members'
+                      AND column_name = 'tree_level'
+                )
+            """)
+            if not cur.fetchone()[0]:
+                raise Exception("❌ Column tree_level does not exist in processing.dimension_set_members")
+            
+            # Get counts for validation
+            cur.execute("""
+                SELECT 
+                    COUNT(*) as total_dimensions,
+                    COUNT(*) FILTER (WHERE is_tree = true) as hierarchical_dimensions
+                FROM processing.dimension_set
+            """)
+            total_dims, hierarchical_dims = cur.fetchone()
+            
+            cur.execute("SELECT COUNT(*) FROM processing.dimension_set_members")
+            total_members = cur.fetchone()[0]
+            
+            if total_dims == 0:
+                raise Exception("❌ No dimensions found - run script 12 first")
+            
+            if total_members == 0:
+                raise Exception("❌ No dimension members found - run script 13 first")
+            
+            return total_dims, hierarchical_dims, total_members
 
-def calculate_tree_levels(members, dimension_hash):
-    """Calculate tree levels for members in a dimension"""
-    # Skip if there are validation issues
-    validation_issues = validate_member_relationships(members, dimension_hash)
-    circular_refs = detect_circular_references(members, dimension_hash)
-    
-    if validation_issues or circular_refs:
-        return None, validation_issues + circular_refs
-    
-    # Build parent-to-children mapping
-    children_map = defaultdict(list)
-    for _, member in members.iterrows():
-        if pd.notna(member['parent_member_id']):
-            children_map[member['parent_member_id']].append(member['member_id'])
-    
-    # Find root nodes (members with no parent)
-    root_nodes = members[members['parent_member_id'].isna()]['member_id'].tolist()
-    
-    if not root_nodes:
-        return None, [{
-            'type': 'no_root_nodes',
-            'dimension_hash': dimension_hash,
-            'message': f"No root nodes found in hierarchical dimension {dimension_hash}"
-        }]
-    
-    # Calculate levels using breadth-first search
-    member_levels = {}
-    queue = deque([(root_id, 1) for root_id in root_nodes])
-    
-    while queue:
-        member_id, level = queue.popleft()
-        member_levels[member_id] = level
-        
-        # Add children to queue with next level
-        for child_id in children_map[member_id]:
-            queue.append((child_id, level + 1))
-    
-    return member_levels, []
-
-def update_tree_levels(dimension_hash, member_levels):
-    """Update tree_level values in the database"""
-    if not member_levels:
-        return 0
-    
-    with get_db_conn() as conn:
-        cur = conn.cursor()
-        update_count = 0
-        
-        for member_id, level in member_levels.items():
+def clear_non_hierarchical_tree_levels():
+    """Clear tree_level for members in non-hierarchical dimensions"""
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
             cur.execute("""
                 UPDATE processing.dimension_set_members 
-                SET tree_level = %s
-                WHERE dimension_hash = %s AND member_id = %s
-            """, (level, dimension_hash, member_id))
-            update_count += cur.rowcount
-        
-        conn.commit()
-        return update_count
+                SET tree_level = NULL
+                WHERE dimension_hash IN (
+                    SELECT dimension_hash 
+                    FROM processing.dimension_set 
+                    WHERE is_tree = false OR is_tree IS NULL
+                )
+            """)
+            
+            cleared_count = cur.rowcount
+            conn.commit()
+            
+            return cleared_count
 
-def clear_tree_levels_for_non_hierarchical():
-    """Set tree_level to NULL for members in non-hierarchical dimensions"""
-    with get_db_conn() as conn:
-        cur = conn.cursor()
-        
-        cur.execute("""
-            UPDATE processing.dimension_set_members 
-            SET tree_level = NULL
-            WHERE dimension_hash IN (
-                SELECT dimension_hash 
-                FROM processing.dimension_set 
-                WHERE is_tree = false OR is_tree IS NULL
-            )
-        """)
-        
-        cleared_count = cur.rowcount
-        conn.commit()
-        
-        logger.info(f"Cleared tree_level for {cleared_count} members in non-hierarchical dimensions")
+def detect_data_quality_issues():
+    """Detect circular references, orphaned members, and self-references using SQL"""
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            # Detect self-references
+            cur.execute("""
+                SELECT dimension_hash, member_id, 'self_reference' as issue_type
+                FROM processing.dimension_set_members
+                WHERE member_id = parent_member_id
+            """)
+            self_refs = cur.fetchall()
+            
+            # Detect orphaned members (parent doesn't exist in same dimension)
+            cur.execute("""
+                SELECT dsm1.dimension_hash, dsm1.member_id, dsm1.parent_member_id, 'orphaned_member' as issue_type
+                FROM processing.dimension_set_members dsm1
+                LEFT JOIN processing.dimension_set_members dsm2 
+                    ON dsm1.dimension_hash = dsm2.dimension_hash 
+                    AND dsm1.parent_member_id = dsm2.member_id
+                WHERE dsm1.parent_member_id IS NOT NULL 
+                    AND dsm2.member_id IS NULL
+                LIMIT 10  -- Limit to avoid excessive logging
+            """)
+            orphaned_members = cur.fetchall()
+            
+            return self_refs, orphaned_members
 
-def generate_summary_statistics():
-    """Generate and log summary statistics"""
-    with get_db_conn() as conn:
-        # Overall statistics
-        stats = pd.read_sql("""
-            SELECT 
-                COUNT(*) as total_members,
-                COUNT(tree_level) as members_with_levels,
-                MIN(tree_level) as min_level,
-                MAX(tree_level) as max_level
-            FROM processing.dimension_set_members
-        """, conn)
-        
-        row = stats.iloc[0]
-        logger.success(f"Updated {row['members_with_levels']:,} members with tree levels (range: {row['min_level']}-{row['max_level']})")
+def calculate_tree_levels_sql():
+    """Calculate tree levels using PostgreSQL recursive CTE for maximum efficiency"""
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            # Use recursive CTE to calculate tree levels efficiently
+            cur.execute("""
+                WITH RECURSIVE tree_levels AS (
+                    -- Base case: root nodes (no parent) start at level 1
+                    SELECT 
+                        dimension_hash,
+                        member_id,
+                        1 as tree_level
+                    FROM processing.dimension_set_members dsm
+                    WHERE parent_member_id IS NULL
+                      AND dimension_hash IN (
+                          SELECT dimension_hash 
+                          FROM processing.dimension_set 
+                          WHERE is_tree = true
+                      )
+                    
+                    UNION ALL
+                    
+                    -- Recursive case: children are one level deeper than their parents
+                    SELECT 
+                        dsm.dimension_hash,
+                        dsm.member_id,
+                        tl.tree_level + 1
+                    FROM processing.dimension_set_members dsm
+                    INNER JOIN tree_levels tl 
+                        ON dsm.dimension_hash = tl.dimension_hash 
+                        AND dsm.parent_member_id = tl.member_id
+                    WHERE tl.tree_level < 20  -- Prevent infinite recursion
+                )
+                UPDATE processing.dimension_set_members
+                SET tree_level = tree_levels.tree_level
+                FROM tree_levels
+                WHERE processing.dimension_set_members.dimension_hash = tree_levels.dimension_hash
+                    AND processing.dimension_set_members.member_id = tree_levels.member_id
+            """)
+            
+            updated_count = cur.rowcount
+            conn.commit()
+            
+            return updated_count
+
+def detect_circular_references():
+    """Detect circular references by finding members that couldn't be assigned levels"""
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            # Find hierarchical members that should have levels but don't
+            cur.execute("""
+                SELECT dsm.dimension_hash, dsm.member_id, dsm.parent_member_id
+                FROM processing.dimension_set_members dsm
+                JOIN processing.dimension_set ds ON dsm.dimension_hash = ds.dimension_hash
+                WHERE ds.is_tree = true 
+                    AND dsm.tree_level IS NULL
+                    AND dsm.parent_member_id IS NOT NULL
+                LIMIT 10  -- Limit to avoid excessive logging
+            """)
+            
+            circular_refs = cur.fetchall()
+            return circular_refs
+
+def validate_results():
+    """Validate tree level calculation results and generate statistics"""
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            # Get overall statistics
+            cur.execute("""
+                SELECT 
+                    COUNT(*) as total_members,
+                    COUNT(tree_level) as members_with_levels,
+                    COUNT(*) FILTER (WHERE tree_level IS NULL) as members_without_levels,
+                    MIN(tree_level) as min_level,
+                    MAX(tree_level) as max_level,
+                    COUNT(DISTINCT tree_level) as distinct_levels
+                FROM processing.dimension_set_members
+            """)
+            total, with_levels, without_levels, min_level, max_level, distinct_levels = cur.fetchone()
+            
+            # Get hierarchical dimension statistics
+            cur.execute("""
+                SELECT COUNT(*) 
+                FROM processing.dimension_set_members dsm
+                JOIN processing.dimension_set ds ON dsm.dimension_hash = ds.dimension_hash
+                WHERE ds.is_tree = true
+            """)
+            hierarchical_members = cur.fetchone()[0]
+            
+            # Check for members in hierarchical dimensions without levels
+            cur.execute("""
+                SELECT COUNT(*)
+                FROM processing.dimension_set_members dsm
+                JOIN processing.dimension_set ds ON dsm.dimension_hash = ds.dimension_hash
+                WHERE ds.is_tree = true AND dsm.tree_level IS NULL
+            """)
+            hierarchical_without_levels = cur.fetchone()[0]
+            
+            return {
+                'total_members': total,
+                'with_levels': with_levels,
+                'without_levels': without_levels,
+                'min_level': min_level,
+                'max_level': max_level,
+                'distinct_levels': distinct_levels,
+                'hierarchical_members': hierarchical_members,
+                'hierarchical_without_levels': hierarchical_without_levels
+            }
 
 def main():
     """Main tree level calculation function"""
+    logger.info("🚀 Starting tree level calculation...")
+    
     try:
-        logger.info("🚀 Starting tree level calculation...")
+        # Validate prerequisites
+        total_dims, hierarchical_dims, total_members = validate_prerequisites()
+        logger.info(f"📊 Processing {hierarchical_dims:,} hierarchical dimensions with {total_members:,} total members...")
         
-        check_required_tables()
+        # Clear tree levels for non-hierarchical dimensions
+        cleared_count = clear_non_hierarchical_tree_levels()
         
-        # Clear tree levels for non-hierarchical dimensions first
-        clear_tree_levels_for_non_hierarchical()
+        # Detect data quality issues before processing
+        self_refs, orphaned_members = detect_data_quality_issues()
         
-        # Load hierarchical dimensions
-        hierarchical_dims = load_hierarchical_dimensions()
+        # Calculate tree levels using efficient recursive SQL
+        updated_count = calculate_tree_levels_sql()
         
-        if len(hierarchical_dims) == 0:
-            logger.warning("⚠️ No hierarchical dimensions found (is_tree=true)")
-            return
+        # Detect circular references (members that couldn't be assigned levels)
+        circular_refs = detect_circular_references()
         
-        total_updated = 0
-        total_issues = []
+        # Validate results
+        results = validate_results()
         
-        # Process each hierarchical dimension
-        for _, dim_row in hierarchical_dims.iterrows():
-            dimension_hash = dim_row['dimension_hash']
-            
-            # Load members for this dimension
-            members = load_dimension_members(dimension_hash)
-            
-            if len(members) == 0:
-                continue
-            
-            # Calculate tree levels
-            member_levels, issues = calculate_tree_levels(members, dimension_hash)
-            
-            if issues:
-                total_issues.extend(issues)
-                continue
-            
-            # Update database
-            updated_count = update_tree_levels(dimension_hash, member_levels)
-            total_updated += updated_count
+        # Final summary
+        logger.success(f"✅ Tree level calculation complete: {results['with_levels']:,} members assigned levels")
         
-        # Generate summary statistics
-        generate_summary_statistics()
+        # Warn about data quality issues
+        if self_refs:
+            logger.warning(f"⚠️ Found {len(self_refs)} self-referencing members")
         
-        # Report any issues found
-        if total_issues:
-            logger.warning(f"Found {len(total_issues)} validation issues")
-            # Only log first few issues to avoid spam
-            for issue in total_issues[:3]:
-                logger.warning(issue['message'])
-            if len(total_issues) > 3:
-                logger.warning(f"... and {len(total_issues) - 3} more issues")
+        if orphaned_members:
+            logger.warning(f"⚠️ Found {len(orphaned_members)} orphaned members (parent doesn't exist)")
         
-        logger.success(f"Tree level calculation complete! Updated {total_updated:,} members")
+        if circular_refs:
+            logger.warning(f"⚠️ Found {len(circular_refs)} potential circular references")
+        
+        if results['hierarchical_without_levels'] > 0:
+            logger.warning(f"⚠️ {results['hierarchical_without_levels']} hierarchical members without levels - check for circular references")
+        
+        # Log level distribution if significant
+        if results['max_level'] and results['max_level'] > 1:
+            logger.info(f"📈 Tree depth: {results['distinct_levels']} levels (max depth: {results['max_level']})")
         
     except Exception as e:
         logger.exception(f"❌ Tree level calculation failed: {e}")
