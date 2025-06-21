@@ -1,38 +1,36 @@
+#!/usr/bin/env python3
 """
-Enhanced Spine Fetch Script - Statistics Canada ETL Pipeline
-===========================================================
+Statcan Public Data ETL Pipeline
+Script: 01_spine_fetch_raw_v2.py
+Date: 2025-06-21
+Author: Paul Verbrugge with Claude Sonnet 4
 
-This script downloads and validates the complete list of available data cubes 
-from Statistics Canada's Web Data Service API. It implements comprehensive 
-validation to protect against data corruption and ensures only verified, 
-complete responses are archived.
+Fetches the complete inventory of Statistics Canada data cubes from the getAllCubesListLite
+endpoint and archives new versions using hash-based deduplication. This forms the foundation
+of the ETL pipeline by maintaining a historical record of cube metadata changes.
 
-Key Features:
-- Fetches complete cube catalog from getAllCubesListLite endpoint
-- Validates response structure, cube count, and data quality
-- Uses SHA-256 hashing for deduplication and change detection
-- Maintains versioned archive of all spine snapshots
-- Fails fast on validation errors to prevent corruption
-- Preserves existing data when responses are invalid
+The script implements atomic operations to ensure data consistency and uses SHA256 hashing
+to detect changes in the spine metadata. Only new versions are stored, preventing
+unnecessary storage bloat while maintaining complete audit trails.
 
-Process Flow:
-1. Download complete cube list from StatCan API
-2. Validate response structure and data quality
-3. Calculate content hash for deduplication
-4. Save to versioned file archive if validation passes
-5. Update database tracking with new active file
+Key Operations:
+- Fetch complete cube inventory from StatCan WDS API
+- Generate SHA256 hash for change detection  
+- Store new versions with atomic database operations
+- Maintain active/inactive flags for version management
 
-Protection Mechanisms:
-- Response validation (structure, size, content)
-- Hash-based deduplication prevents duplicate processing
-- File versioning preserves historical snapshots
-- Atomic database operations with rollback capability
+Dependencies:
+- Internet connectivity to StatCan WDS API
+- PostgreSQL database with raw_files.manage_spine_raw_files table
+- Write permissions to /app/raw/metadata directory
 
-Last Updated: June 2025
-Author: Paul Verbrugge with Claude 3.5 Sonnet (v20241022)e
+Processing Logic:
+1. Fetch JSON from getAllCubesListLite endpoint
+2. Calculate SHA256 hash of normalized JSON content
+3. Check database for existing hash to prevent duplicates
+4. If new: save file, deactivate old versions, insert new record
+5. Commit transaction atomically or rollback on failure
 """
-
-# statcan/scripts/01_spine_fetch_raw.py
 
 import os
 import json
@@ -44,192 +42,265 @@ from loguru import logger
 from pathlib import Path
 from statcan.tools.config import DB_CONFIG
 
-# Add file logging
-logger.add("/app/logs/fetch_spine.log", rotation="10 MB", retention="7 days")
+# Configure structured logging with rotation
+logger.add("/app/logs/spine_fetch_raw_v2.log", rotation="10 MB", retention="7 days")
 
+# StatCan API configuration
 SPINE_URL = "https://www150.statcan.gc.ca/t1/wds/rest/getAllCubesListLite"
 ARCHIVE_DIR = Path("/app/raw/metadata")
-
-# Validation constants
-MIN_EXPECTED_CUBES = 1000  # StatCan has thousands of cubes
-REQUIRED_FIELDS = ['productId', 'cubeTitleEn', 'cubeStartDate']
-OPTIONAL_FIELDS = ['cubeTitleFr', 'cubeEndDate', 'releaseTime', 'archived', 'subjectCode', 'surveyCode']
+API_TIMEOUT = 30
+MAX_RETRIES = 3
 
 
-def fetch_json():
-    """Fetch spine data from StatCan API with timeout and error handling"""
-    logger.info(f"Requesting cube metadata from: {SPINE_URL}")
-    try:
-        resp = requests.get(SPINE_URL, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        logger.info(f"✅ API response received: {len(str(resp.content))} bytes")
-        return data
-    except requests.exceptions.Timeout:
-        logger.error("❌ API request timed out after 30 seconds")
-        raise
-    except requests.exceptions.RequestException as e:
-        logger.error(f"❌ API request failed: {e}")
-        raise
-    except json.JSONDecodeError as e:
-        logger.error(f"❌ Invalid JSON response: {e}")
-        raise
-
-
-def validate_spine_response(data) -> bool:
-    """Comprehensive validation of spine API response"""
-    logger.info("🔍 Validating spine response...")
+def fetch_spine_metadata() -> dict:
+    """Fetch cube inventory from StatCan WDS API with retry logic
     
-    # Check if response is a list
-    if not isinstance(data, list):
-        logger.error(f"❌ Response is not a list, got: {type(data)}")
-        return False
-    
-    # Check minimum number of cubes
-    cube_count = len(data)
-    if cube_count < MIN_EXPECTED_CUBES:
-        logger.error(f"❌ Only {cube_count} cubes returned - expected at least {MIN_EXPECTED_CUBES}")
-        return False
-    
-    logger.info(f"✅ Cube count check passed: {cube_count} cubes")
-    
-    # Validate structure of first 10 records
-    for i, cube in enumerate(data[:10]):
-        if not isinstance(cube, dict):
-            logger.error(f"❌ Cube {i} is not a dictionary: {type(cube)}")
-            return False
+    Returns:
+        dict: Complete cube inventory in JSON format
         
-        # Check required fields
-        missing_required = [field for field in REQUIRED_FIELDS if field not in cube]
-        if missing_required:
-            logger.error(f"❌ Cube {i} (productId: {cube.get('productId', 'unknown')}) missing required fields: {missing_required}")
-            return False
-        
-        # Validate productId is numeric
+    Raises:
+        requests.RequestException: If API call fails after retries
+    """
+    logger.info(f"🚀 Starting spine metadata fetch...")
+    logger.info(f"📡 Endpoint: {SPINE_URL}")
+    
+    for attempt in range(MAX_RETRIES):
         try:
-            product_id = int(cube['productId'])
-            if product_id <= 0:
-                logger.error(f"❌ Cube {i} has invalid productId: {product_id}")
-                return False
-        except (ValueError, TypeError):
-            logger.error(f"❌ Cube {i} has non-numeric productId: {cube.get('productId')}")
-            return False
+            response = requests.get(SPINE_URL, timeout=API_TIMEOUT)
+            response.raise_for_status()
+            
+            data = response.json()
+            cube_count = len(data) if isinstance(data, list) else len(data.get('cubes', []))
+            logger.success(f"✅ Retrieved {cube_count:,} cube records from API")
+            
+            return data
+            
+        except requests.exceptions.Timeout:
+            logger.warning(f"⚠️ API timeout (attempt {attempt + 1}/{MAX_RETRIES})")
+            if attempt == MAX_RETRIES - 1:
+                raise
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ API request failed (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+            if attempt == MAX_RETRIES - 1:
+                raise
+
+
+def calculate_content_hash(data: dict) -> str:
+    """Generate SHA256 hash of JSON content for change detection
+    
+    Args:
+        data: JSON data structure to hash
         
-        # Check title is not empty
-        title = cube.get('cubeTitleEn', '').strip()
-        if not title:
-            logger.error(f"❌ Cube {i} (productId: {cube['productId']}) has empty English title")
-            return False
+    Returns:
+        str: SHA256 hash as hexadecimal string
+        
+    Note:
+        Uses sorted keys to ensure consistent hashing regardless of key order
+    """
+    normalized_json = json.dumps(data, sort_keys=True)
+    content_bytes = normalized_json.encode('utf-8')
+    hash_value = hashlib.sha256(content_bytes).hexdigest()
     
-    logger.info("✅ Structure validation passed for sample records")
-    
-    # Check for reasonable distribution of product IDs
-    product_ids = [cube.get('productId') for cube in data[:100]]
-    unique_ids = set(product_ids)
-    if len(unique_ids) != len(product_ids):
-        logger.error("❌ Duplicate product IDs detected in sample")
-        return False
-    
-    # Check product ID ranges (StatCan uses 8-digit IDs starting with subject codes)
-    valid_id_count = sum(1 for pid in product_ids if isinstance(pid, int) and 10000000 <= pid <= 99999999)
-    if valid_id_count < len(product_ids) * 0.9:  # Allow 10% variance
-        logger.error(f"❌ Too many invalid product ID formats: {valid_id_count}/{len(product_ids)}")
-        return False
-    
-    logger.info("✅ Product ID validation passed")
-    
-    # Log summary statistics
-    archived_count = sum(1 for cube in data if cube.get('archived') == 1)
-    with_subjects = sum(1 for cube in data if cube.get('subjectCode'))
-    
-    logger.info(f"📊 Validation summary:")
-    logger.info(f"   Total cubes: {cube_count}")
-    logger.info(f"   Archived cubes: {archived_count}")
-    logger.info(f"   Cubes with subjects: {with_subjects}")
-    
-    logger.success("✅ Spine response validation passed")
-    return True
+    logger.info(f"🔍 Generated content hash: {hash_value[:16]}...")
+    return hash_value
 
 
-def hash_json(data: dict) -> str:
-    """Generate consistent hash of JSON data"""
-    b = json.dumps(data, sort_keys=True).encode("utf-8")
-    return hashlib.sha256(b).hexdigest()
-
-
-def save_file(data: dict, file_hash: str) -> str:
-    """Save validated spine data to disk"""
+def save_metadata_file(data: dict, file_hash: str) -> str:
+    """Save metadata to disk with hash-based filename
+    
+    Args:
+        data: JSON metadata to save
+        file_hash: SHA256 hash for filename generation
+        
+    Returns:
+        str: Full path to saved file
+        
+    Raises:
+        OSError: If file creation fails
+    """
+    # Ensure archive directory exists
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Generate filename with hash prefix for uniqueness
     filename = f"spine_{file_hash[:16]}.json"
     file_path = ARCHIVE_DIR / filename
     
-    try:
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        logger.info(f"💾 Saved spine file: {file_path}")
-        return str(file_path)
-    except Exception as e:
-        logger.error(f"❌ Failed to save file {file_path}: {e}")
-        raise
+    # Save with UTF-8 encoding and pretty formatting
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    
+    logger.info(f"💾 Saved metadata file: {file_path}")
+    return str(file_path)
 
 
-def file_exists(cur, file_hash: str) -> bool:
-    """Check if file hash already exists in database"""
-    cur.execute("SELECT 1 FROM raw_files.manage_spine_raw_files WHERE file_hash = %s", (file_hash,))
-    return cur.fetchone() is not None
+def check_hash_exists(cur, file_hash: str) -> bool:
+    """Check if hash already exists in database
+    
+    Args:
+        cur: Database cursor
+        file_hash: SHA256 hash to check
+        
+    Returns:
+        bool: True if hash exists, False otherwise
+    """
+    cur.execute(
+        "SELECT 1 FROM raw_files.manage_spine_raw_files WHERE file_hash = %s", 
+        (file_hash,)
+    )
+    exists = cur.fetchone() is not None
+    
+    if exists:
+        logger.info(f"🔍 Hash already exists in database: {file_hash[:16]}...")
+    
+    return exists
 
 
-def deactivate_existing(cur):
-    """Deactivate all currently active spine files"""
-    cur.execute("UPDATE raw_files.manage_spine_raw_files SET active = FALSE WHERE active = TRUE")
-    deactivated = cur.rowcount
-    if deactivated > 0:
-        logger.info(f"🔄 Deactivated {deactivated} existing spine file(s)")
+def deactivate_existing_files(cur):
+    """Deactivate all currently active spine files
+    
+    Args:
+        cur: Database cursor
+        
+    Note:
+        Part of atomic operation to ensure only one active file
+    """
+    cur.execute(
+        "UPDATE raw_files.manage_spine_raw_files SET active = FALSE WHERE active = TRUE"
+    )
+    deactivated_count = cur.rowcount
+    
+    if deactivated_count > 0:
+        logger.info(f"🔄 Deactivated {deactivated_count} existing spine file(s)")
 
 
-def insert_record(cur, file_hash: str, file_path: str):
-    """Insert new spine file record and activate it"""
-    deactivate_existing(cur)
+def insert_file_record(cur, file_hash: str, file_path: str):
+    """Insert new file record and activate it
+    
+    Args:
+        cur: Database cursor
+        file_hash: SHA256 hash of the file
+        file_path: Full path to saved file
+    """
     cur.execute("""
         INSERT INTO raw_files.manage_spine_raw_files (
             file_hash, date_download, active, storage_location
         ) VALUES (%s, now(), TRUE, %s)
     """, (file_hash, file_path))
-    logger.info(f"📝 Registered new active spine file: {file_hash[:16]}")
+    
+    logger.info(f"📝 Inserted new spine file record: {file_hash[:16]}...")
+
+
+def validate_prerequisites():
+    """Validate that required tables and directories exist
+    
+    Raises:
+        Exception: If prerequisites are not met
+    """
+    # Test database connectivity and table existence
+    try:
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COUNT(*) FROM information_schema.tables 
+                    WHERE table_schema = 'raw_files' 
+                    AND table_name = 'manage_spine_raw_files'
+                """)
+                
+                if cur.fetchone()[0] == 0:
+                    raise Exception("❌ Table raw_files.manage_spine_raw_files does not exist")
+                
+        logger.success("✅ Prerequisites validated")
+        
+    except psycopg2.Error as e:
+        raise Exception(f"❌ Database connectivity failed: {e}")
+
+
+def validate_output():
+    """Validate that the operation completed successfully
+    
+    Raises:
+        Exception: If validation fails
+    """
+    try:
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor() as cur:
+                # Check that exactly one file is active
+                cur.execute(
+                    "SELECT COUNT(*) FROM raw_files.manage_spine_raw_files WHERE active = TRUE"
+                )
+                active_count = cur.fetchone()[0]
+                
+                if active_count != 1:
+                    raise Exception(f"❌ Expected 1 active spine file, found {active_count}")
+                
+                # Get details of active file
+                cur.execute("""
+                    SELECT file_hash, storage_location, date_download 
+                    FROM raw_files.manage_spine_raw_files 
+                    WHERE active = TRUE
+                """)
+                file_hash, storage_location, date_download = cur.fetchone()
+                
+                # Verify file exists on disk
+                if not Path(storage_location).exists():
+                    raise Exception(f"❌ Active file not found on disk: {storage_location}")
+                
+                logger.success(f"✅ Validation passed:")
+                logger.info(f"📊 Active file: {file_hash[:16]}...")
+                logger.info(f"📁 Location: {storage_location}")
+                logger.info(f"📅 Downloaded: {date_download}")
+                
+    except psycopg2.Error as e:
+        raise Exception(f"❌ Validation query failed: {e}")
 
 
 def main():
-    logger.info("🚀 Starting spine archive fetch...")
-
+    """Main processing function with comprehensive error handling"""
+    logger.info("🚀 Starting spine metadata archival process...")
+    
     try:
-        # Fetch data from API
-        data = fetch_json()
+        # Validate prerequisites
+        validate_prerequisites()
         
-        # Validate response before proceeding
-        if not validate_spine_response(data):
-            logger.error("❌ Spine response validation failed - aborting")
-            return
+        # Fetch data from StatCan API
+        metadata = fetch_spine_metadata()
         
-        # Calculate hash and check for duplicates
-        file_hash = hash_json(data)
-        logger.info(f"🔢 Calculated file hash: {file_hash[:16]}...")
-
+        # Calculate hash for change detection
+        file_hash = calculate_content_hash(metadata)
+        
+        # Process with atomic database operations
         with psycopg2.connect(**DB_CONFIG) as conn:
             with conn.cursor() as cur:
-                if file_exists(cur, file_hash):
-                    logger.info("ℹ️  Duplicate spine file – already archived, no changes needed")
+                # Check if this version already exists
+                if check_hash_exists(cur, file_hash):
+                    logger.warning("⚠️ Duplicate spine metadata - no changes detected")
+                    logger.info("🎉 Process completed - no action required")
                     return
-
-                # Save file and register in database
-                file_path = save_file(data, file_hash)
-                insert_record(cur, file_hash, file_path)
-                conn.commit()
                 
-                logger.success(f"✅ Successfully archived new spine file: {file_path}")
-                logger.info(f"📊 Contains {len(data)} cube definitions")
-
+                # Save file to disk first
+                file_path = save_metadata_file(metadata, file_hash)
+                
+                # Atomic database update
+                deactivate_existing_files(cur)
+                insert_file_record(cur, file_hash, file_path)
+                
+                # Commit transaction
+                conn.commit()
+                logger.success("💾 Database transaction committed")
+        
+        # Validate successful completion
+        validate_output()
+        
+        logger.success("🎉 Spine metadata archival completed successfully!")
+        
+    except requests.RequestException as e:
+        logger.error(f"❌ API request failed: {e}")
+        raise
+    except psycopg2.Error as e:
+        logger.error(f"❌ Database operation failed: {e}")
+        raise
     except Exception as e:
-        logger.exception(f"❌ Spine fetch pipeline failed: {e}")
+        logger.error(f"❌ Unexpected error: {e}")
         raise
 
 
