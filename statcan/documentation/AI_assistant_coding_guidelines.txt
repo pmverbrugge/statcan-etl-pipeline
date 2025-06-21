@@ -1,0 +1,396 @@
+# Coding Guidelines for AI Development Assistance
+## Statistics Canada Public Data ETL Pipeline
+
+This document provides coding standards and architectural guidelines for AI assistants working on the StatCan ETL pipeline. These guidelines ensure consistency, maintainability, and optimal performance across the codebase.
+
+## Project Context
+
+**Mission**: Build a comprehensive Canadian statistical intelligence platform that transforms all Statistics Canada public data into an AI-powered analytics ecosystem enabling cross-domain insights impossible through StatCan's native tools.
+
+**Architecture**: Containerized ETL pipeline with PostgreSQL data warehouse, featuring sophisticated dimension registry for cross-cube analytics and harmonized time series analysis.
+
+## Core Architectural Principles
+
+### Database Processing Hierarchy
+1. **PostgreSQL-First**: Use direct PostgreSQL operations for database-to-database ETL work
+2. **DuckDB for Analytics**: Use DuckDB for file processing, complex analytics, or when working with external data sources
+3. **Pandas Minimally**: Reserve pandas only for Python-specific operations that cannot be efficiently done in SQL
+
+**Rationale**: PostgreSQL-first eliminates external dependencies, leverages existing database extensions (pgcrypto, PostGIS), and provides simpler error handling. DuckDB excels at file processing and memory-efficient analytics. Pandas adds overhead and complexity for database operations.
+
+### Data Integration Strategy
+- **Unified Fact Tables**: All ~9,000 cubes flow into normalized fact tables (not individual cube tables)
+- **Dimension Normalization**: Create reusable dimension sets spanning multiple cubes
+- **Hash-Based Change Detection**: Enable incremental updates while preventing duplicate processing
+- **Coordinate Preservation**: Maintain StatCan's native addressing while adding normalized member IDs
+
+### Container Architecture
+- **ETL Container**: Cannot modify database structure (no DDL permissions)
+- **Database Container**: Separate container with full schema control
+- **Separation of Concerns**: ETL scripts focus on data processing; DDL changes require separate database scripts
+
+## Code Standards
+
+### Script Header Format
+Every script must include this standardized header:
+
+```python
+#!/usr/bin/env python3
+"""
+Statcan Public Data ETL Pipeline
+Script: [script_name].py
+Date: [YYYY-MM-DD]
+Author: Paul Verbrugge with [AI_Model_Name_Version]
+
+[Brief description of script purpose and functionality]
+
+[Detailed description of processing logic and approach]
+
+Key Operations:
+- [List key operations performed]
+- [Processing steps]
+- [Output descriptions]
+
+Dependencies:
+- [Required input tables/files]
+- [Prerequisite scripts that must run first]
+- [External dependencies]
+"""
+```
+
+### Technology Preferences
+
+#### Database Operations
+```python
+# ✅ PREFERRED: Direct PostgreSQL operations
+with psycopg2.connect(**DB_CONFIG) as conn:
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO target_table 
+        SELECT processed_data FROM source_table
+        WHERE conditions
+    """)
+
+# ❌ AVOID: Pandas for database-to-database operations
+df = pd.read_sql("SELECT * FROM source_table", conn)
+df.to_sql("target_table", conn)
+```
+
+#### Data Processing
+```python
+# ✅ PREFERRED: SQL-based transformations
+cur.execute("""
+    UPDATE table SET 
+    normalized_field = LOWER(TRIM(source_field)),
+    hash_field = SUBSTR(ENCODE(DIGEST(key_fields, 'sha256'), 'hex'), 1, 12)
+""")
+
+# ✅ ACCEPTABLE: DuckDB for complex analytics or file processing
+duck_conn.execute("""
+    CREATE TABLE processed AS
+    SELECT * FROM read_csv_auto('/path/to/file.csv')
+    WHERE complex_analytical_conditions
+""")
+
+# ❌ AVOID: Pandas unless absolutely necessary
+df['normalized'] = df['source'].str.lower().str.strip()
+df['hash'] = df.apply(lambda x: hash_function(x), axis=1)
+```
+
+### Error Handling and Logging
+
+#### Logging Standards
+```python
+from loguru import logger
+
+# Configure with rotation and emoji indicators
+logger.add("/app/logs/script_name.log", rotation="10 MB", retention="7 days")
+
+# Use consistent emoji patterns
+logger.info("🚀 Starting processing...")           # Start operations
+logger.info("📥 Loading data...")                 # Data loading
+logger.info("🔨 Processing...")                   # Core processing
+logger.info("💾 Storing results...")              # Data storage
+logger.success("✅ Processing complete!")         # Success
+logger.warning("⚠️ Data quality issue...")        # Warnings
+logger.error("❌ Processing failed...")            # Errors
+logger.info("🔍 Validating...")                   # Validation
+logger.info("📊 Statistics...")                   # Reporting
+```
+
+#### Error Handling Patterns
+```python
+def main():
+    try:
+        # Validate prerequisites
+        check_required_tables()
+        
+        # Core processing
+        process_data()
+        
+        # Validate output
+        validate_results()
+        
+        logger.success("🎉 Processing completed successfully!")
+        
+    except Exception as e:
+        logger.exception(f"❌ Processing failed: {e}")
+        raise
+
+def check_required_tables():
+    """Validate prerequisites before processing"""
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        cur = conn.cursor()
+        
+        # Check input data exists
+        cur.execute("SELECT COUNT(*) FROM input_table")
+        count = cur.fetchone()[0]
+        
+        if count == 0:
+            raise Exception("❌ No input data found! Run prerequisite script first.")
+        
+        logger.success("✅ Prerequisites validated")
+```
+
+### Data Quality and Validation
+
+#### Comprehensive Validation
+```python
+def validate_output():
+    """Validate processed output for data quality"""
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        cur = conn.cursor()
+        
+        # Basic counts
+        cur.execute("SELECT COUNT(*) FROM processed_table")
+        processed_count = cur.fetchone()[0]
+        
+        # Data quality checks
+        cur.execute("""
+            SELECT 
+                COUNT(*) FILTER (WHERE key_field IS NULL) as null_keys,
+                COUNT(*) FILTER (WHERE hash_field IS NULL) as null_hashes,
+                COUNT(DISTINCT hash_field) as unique_hashes
+            FROM processed_table
+        """)
+        
+        null_keys, null_hashes, unique_hashes = cur.fetchone()
+        
+        # Report issues
+        if null_keys > 0:
+            logger.warning(f"⚠️ Found {null_keys} records with NULL keys")
+        
+        if null_hashes > 0:
+            logger.error(f"❌ Found {null_hashes} records with NULL hashes")
+            raise Exception("Hash generation failed for some records")
+        
+        # Success metrics
+        dedup_rate = ((processed_count - unique_hashes) / processed_count * 100) if processed_count > 0 else 0
+        logger.info(f"📈 Deduplication rate: {dedup_rate:.1f}%")
+        logger.success(f"✅ Validation passed: {processed_count:,} records processed")
+```
+
+### Performance Optimization
+
+#### Batch Processing
+```python
+# ✅ Process large datasets in batches
+BATCH_SIZE = 1000
+
+for i in range(0, len(items), BATCH_SIZE):
+    batch = items[i:i + BATCH_SIZE]
+    process_batch(batch)
+    
+    # Progress logging
+    if i % 10000 == 0:
+        logger.info(f"📈 Progress: {i:,}/{len(items):,} items processed")
+```
+
+#### Atomic Operations
+```python
+# ✅ Use transactions for data consistency
+with psycopg2.connect(**DB_CONFIG) as conn:
+    try:
+        cur = conn.cursor()
+        
+        # Clear existing data
+        cur.execute("TRUNCATE TABLE target_table")
+        
+        # Insert new data
+        cur.execute("INSERT INTO target_table SELECT * FROM staging_table")
+        
+        # Validate results
+        cur.execute("SELECT COUNT(*) FROM target_table")
+        final_count = cur.fetchone()[0]
+        
+        if final_count == 0:
+            raise Exception("No data inserted")
+        
+        conn.commit()
+        logger.success(f"✅ Transaction completed: {final_count:,} records")
+        
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"❌ Transaction rolled back: {e}")
+        raise
+```
+
+## ETL Pipeline Patterns
+
+### Hash-Based Deduplication
+```python
+# Standard pattern for generating consistent hashes
+hash_query = """
+    SUBSTR(
+        ENCODE(
+            DIGEST(
+                CONCAT(
+                    LOWER(TRIM(COALESCE(CAST(key1 AS TEXT), ''))), '|',
+                    LOWER(TRIM(COALESCE(key2, ''))), '|',
+                    LOWER(TRIM(COALESCE(CAST(key3 AS TEXT), '')))
+                ), 
+                'sha256'
+            ), 
+            'hex'
+        ), 
+        1, 12
+    ) as hash_field
+"""
+```
+
+### File Processing Patterns
+```python
+def process_files_in_batches(file_list, batch_size=100):
+    """Process files in batches for memory efficiency"""
+    for i in range(0, len(file_list), batch_size):
+        batch = file_list[i:i + batch_size]
+        batch_num = (i // batch_size) + 1
+        total_batches = (len(file_list) + batch_size - 1) // batch_size
+        
+        logger.info(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch)} files)")
+        
+        try:
+            process_file_batch(batch)
+            logger.success(f"✅ Batch {batch_num} completed")
+        except Exception as e:
+            logger.error(f"❌ Batch {batch_num} failed: {e}")
+            continue  # Continue with next batch
+```
+
+### StatCan API Integration
+```python
+# Rate limiting and error handling for StatCan API
+import time
+import requests
+
+RATE_LIMIT_DELAY = 2  # seconds
+API_TIMEOUT = 30      # seconds
+MAX_RETRIES = 3
+
+def call_statcan_api(url, payload=None):
+    """Call StatCan API with proper error handling and rate limiting"""
+    for attempt in range(MAX_RETRIES):
+        try:
+            if payload:
+                response = requests.post(url, json=payload, timeout=API_TIMEOUT)
+            else:
+                response = requests.get(url, timeout=API_TIMEOUT)
+            
+            response.raise_for_status()
+            return response.json()
+            
+        except requests.exceptions.Timeout:
+            logger.warning(f"⚠️ API timeout (attempt {attempt + 1}/{MAX_RETRIES})")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RATE_LIMIT_DELAY * (attempt + 1))
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ API request failed: {e}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RATE_LIMIT_DELAY)
+            else:
+                raise
+    
+    # Rate limiting between successful calls
+    time.sleep(RATE_LIMIT_DELAY)
+```
+
+## Documentation Standards
+
+### Function Documentation
+```python
+def process_dimensions(productid: int) -> dict:
+    """Process dimension metadata for a specific product
+    
+    Args:
+        productid: StatCan 8-digit product identifier
+        
+    Returns:
+        dict: Processing statistics including counts and validation results
+        
+    Raises:
+        Exception: If product has no dimensions or validation fails
+        
+    Example:
+        stats = process_dimensions(13100001)
+        logger.info(f"Processed {stats['dimension_count']} dimensions")
+    """
+```
+
+### Configuration Management
+```python
+# Use environment-aware configuration
+from statcan.tools.config import DB_CONFIG
+
+# Document expected configuration keys
+# DB_CONFIG should contain:
+# - host: Database hostname
+# - database: Database name  
+# - user: Database username
+# - password: Database password
+```
+
+## Testing and Validation Guidelines
+
+### Data Validation Checks
+- **Completeness**: Verify all expected records are processed
+- **Uniqueness**: Check for duplicate hashes or keys
+- **Referential Integrity**: Validate foreign key relationships
+- **Data Types**: Ensure proper type conversion
+- **Range Validation**: Check for reasonable value ranges
+
+### Performance Benchmarks
+- **Processing Speed**: Log processing rates (records/second)
+- **Memory Usage**: Monitor for memory leaks in long-running processes
+- **Database Load**: Validate query performance on large datasets
+- **Error Rates**: Track and minimize processing failures
+
+## AI Assistant Guidelines
+
+When working on this codebase:
+
+1. **Follow the hierarchy**: PostgreSQL-first, then DuckDB, pandas only when necessary
+2. **Maintain consistency**: Use established patterns for logging, error handling, and validation
+3. **Preserve functionality**: Ensure optimizations produce identical results to original code
+4. **Document decisions**: Explain why specific approaches were chosen
+5. **Validate thoroughly**: Include comprehensive data quality checks
+6. **Think integration**: Consider how changes affect downstream processes
+
+## Common Pitfalls to Avoid
+
+- **Over-engineering**: Keep solutions simple and maintainable
+- **Pandas overuse**: Don't default to pandas for database operations
+- **Missing validation**: Always validate input data and output results
+- **Poor error handling**: Ensure graceful failure and meaningful error messages
+- **Inconsistent logging**: Use standardized emoji patterns and log levels
+- **Ignoring constraints**: Respect container separation and DDL restrictions
+
+## Resources
+
+- **StatCan WDS API Documentation**: Web Data Service endpoints and response formats
+- **PostgreSQL Documentation**: Focus on pgcrypto and performance optimization
+- **DuckDB Documentation**: File processing and analytical functions
+- **Project Repository**: `/docs` directory for additional technical documentation
+
+---
+
+*These guidelines evolve with the project. Suggest improvements through issues or pull requests.*
