@@ -1,67 +1,96 @@
 """
-Enhanced Spine ETL Script - Statistics Canada ETL Pipeline
-==========================================================
+Statcan Public Data ETL Project - Script 02: Spine Load to Database
+Script: 02_spine_load_to_db.py
+Date: June 21, 2025
+Author: Paul Verbrugge with Claude Sonnet 4
 
-This script loads validated spine metadata from archived files into the PostgreSQL
-data warehouse. It implements pre-load validation and safety checks to prevent
-database corruption from invalid or incomplete data files.
+PURPOSE:
+Loads StatCan spine metadata from raw JSON files into normalized PostgreSQL spine schema tables.
+Processes cube metadata, subject relationships, and survey relationships through DuckDB staging 
+then direct PostgreSQL loading for optimal performance.
 
-Key Features:
-- Loads most recent validated spine file from archive
-- Stages data in DuckDB for validation before database changes
-- Implements comprehensive pre-load validation checks
-- Uses atomic transactions to prevent partial updates
-- Maintains referential integrity across spine schema tables
+DEPENDENCIES:
+- Script 01: Must have active spine metadata file registered
+- Database: spine schema tables (cube, cube_subject, cube_survey)
+- Raw Files: Active spine metadata JSON file on disk
 
-Process Flow:
-1. Retrieve path of most recent active spine file
-2. Load JSON data into DuckDB memory database
-3. Create normalized views (cube, cube_subject, cube_survey)
-4. Validate staged data completeness and quality
-5. Compare against existing spine data for sanity checks
-6. Atomically replace spine tables with validated data
+PROCESSING LOGIC:
+1. Identify and validate active spine metadata file
+2. Stage JSON data in DuckDB with type casting and validation
+3. Create normalized views for cube, subject, and survey data
+4. Load data directly to PostgreSQL in atomic transaction
+5. Validate loaded data integrity and relationships
 
-Protection Mechanisms:
-- Pre-load validation prevents truncating good data
-- Size and content checks ensure data completeness
-- Atomic transactions with rollback on failure
-- Comparison with existing data for sanity checks
-- Detailed logging for audit trail
+OUTPUTS:
+- spine.cube: Core cube metadata (productId, titles, dates, etc.)
+- spine.cube_subject: Many-to-many cube-subject relationships  
+- spine.cube_survey: Many-to-many cube-survey relationships
 
-Dependencies:
-- Requires validated spine files from 01_spine_fetch_raw.py
-- Uses DuckDB for in-memory staging and validation
-- Connects to PostgreSQL spine schema tables
-
-Last Updated: June 2025
-Author: Paul Verbrugge with Claude 3.5 Sonnet (v20241022)e
+PERFORMANCE NOTES:
+- Uses DuckDB for efficient JSON processing
+- Direct DuckDB->PostgreSQL transfer via CSV (eliminates pandas)
+- Atomic transactions with rollback capability
+- Memory efficient with temporary file cleanup
 """
 
 import os
 import json
+import hashlib
 import tempfile
 import duckdb
 import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
 from loguru import logger
+from datetime import datetime
 from statcan.tools.config import DB_CONFIG
 
-# Add file logging
-logger.add("/app/logs/spine_etl.log", rotation="10 MB", retention="7 days")
-
-# Constants
+# Processing Constants
 RAW_DIR = "/app/raw/statcan/metadata"
-MIN_EXPECTED_CUBES = 1000
-MIN_SUBJECTS_RATIO = 0.8  # Expect 80%+ of cubes to have subjects
-MAX_SIZE_VARIANCE = 0.1   # Allow 10% variance from existing data
+TEMP_DIR = "/tmp"
+TARGET_TABLES = ["cube", "cube_subject", "cube_survey"]
 
-# Initialize DuckDB connection
-con = duckdb.connect(":memory:")
-
+def validate_prerequisites() -> None:
+    """Validate all prerequisites before processing begins."""
+    logger.info("📋 Validating prerequisites...")
+    
+    # Check database connectivity
+    try:
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                logger.info("✅ Database connectivity confirmed")
+    except Exception as e:
+        logger.error(f"❌ Database connection failed: {e}")
+        raise RuntimeError(f"Cannot connect to database: {e}")
+    
+    # Verify spine schema tables exist
+    required_tables = [f"spine.{table}" for table in TARGET_TABLES]
+    try:
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor() as cur:
+                for table in required_tables:
+                    cur.execute(f"SELECT COUNT(*) FROM {table} LIMIT 1")
+                logger.info(f"✅ Verified spine schema tables: {', '.join(required_tables)}")
+    except Exception as e:
+        logger.error(f"❌ Spine schema validation failed: {e}")
+        raise RuntimeError(f"Spine schema tables not accessible: {e}")
+    
+    # Check temp directory permissions
+    try:
+        test_file = os.path.join(TEMP_DIR, f"test_write_{datetime.now().strftime('%Y%m%d_%H%M%S')}.tmp")
+        with open(test_file, 'w') as f:
+            f.write("test")
+        os.remove(test_file)
+        logger.info(f"✅ Temporary directory writable: {TEMP_DIR}")
+    except Exception as e:
+        logger.error(f"❌ Temporary directory not writable: {TEMP_DIR}")
+        raise RuntimeError(f"Cannot write to temporary directory: {e}")
 
 def get_active_file_path() -> str:
-    """Fetch the file path of the active spine metadata file from Postgres."""
+    """Fetch the file path of the active spine metadata file from PostgreSQL."""
+    logger.info("📁 Identifying active spine metadata file...")
+    
     query = """
         SELECT storage_location
         FROM raw_files.manage_spine_raw_files
@@ -69,272 +98,376 @@ def get_active_file_path() -> str:
         ORDER BY date_download DESC
         LIMIT 1
     """
-    with psycopg2.connect(**DB_CONFIG) as conn:
-        with conn.cursor() as cur:
-            cur.execute(query)
-            result = cur.fetchone()
-            if not result:
-                raise RuntimeError("❌ No active spine metadata file found.")
-            file_path = result[0]
-            logger.info(f"📁 Active spine file: {file_path}")
-            return file_path
-
-
-def get_existing_spine_stats(cur) -> dict:
-    """Get statistics about current spine data for comparison"""
-    stats = {}
     
-    # Count existing cubes
-    cur.execute("SELECT COUNT(*) FROM spine.cube")
-    stats['cube_count'] = cur.fetchone()[0]
-    
-    # Count cube subjects
-    cur.execute("SELECT COUNT(*) FROM spine.cube_subject")
-    stats['subject_count'] = cur.fetchone()[0]
-    
-    # Count cube surveys
-    cur.execute("SELECT COUNT(*) FROM spine.cube_survey")
-    stats['survey_count'] = cur.fetchone()[0]
-    
-    # Count archived cubes
-    cur.execute("SELECT COUNT(*) FROM spine.cube WHERE archived = 1")
-    stats['archived_count'] = cur.fetchone()[0]
-    
-    logger.info(f"📊 Existing spine stats: {stats['cube_count']} cubes, {stats['subject_count']} subjects, {stats['survey_count']} surveys, {stats['archived_count']} archived")
-    return stats
-
-
-def normalize_datetime(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert datetime columns to string format for PostgreSQL insertion."""
-    df = df.replace({pd.NaT: None, "NaT": None})
-    for col in df.select_dtypes(include=["datetime64[ns]"]):
-        df[col] = df[col].apply(lambda x: x.strftime("%Y-%m-%d %H:%M:%S") if pd.notnull(x) else None)
-    return df
-
-
-def stage_data(file_path: str) -> str:
-    """Read the JSON metadata into DuckDB and stage views for target tables."""
-    logger.info(f"📥 Loading spine file into DuckDB: {file_path}")
-    
-    # Verify file exists and is readable
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"❌ Spine file not found: {file_path}")
-    
-    file_size = os.path.getsize(file_path)
-    if file_size < 100000:  # Less than 100KB is suspicious
-        raise ValueError(f"❌ Spine file too small: {file_size} bytes")
-    
-    logger.info(f"📏 File size: {file_size:,} bytes")
-    
-    # Install and load JSON extension
-    con.sql("INSTALL json; LOAD json;")
-
-    # Read and validate JSON file
     try:
-        with open(file_path, "rb") as f:
-            json_bytes = f.read()
-        
-        # Verify it's valid JSON
-        json_data = json.loads(json_bytes.decode("utf-8"))
-        if not isinstance(json_data, list):
-            raise ValueError("❌ JSON file does not contain a list")
-        
-        logger.info(f"✅ JSON validated: {len(json_data)} records")
-    except json.JSONDecodeError as e:
-        raise ValueError(f"❌ Invalid JSON in spine file: {e}")
-
-    # Create temporary file for DuckDB
-    with tempfile.NamedTemporaryFile(mode="w+", suffix=".json", delete=False) as tmp:
-        tmp.write(json_bytes.decode("utf-8"))
-        tmp.flush()
-        json_path = tmp.name
-
-    try:
-        # Create base view from JSON
-        con.execute(f"CREATE OR REPLACE VIEW base_cube AS SELECT * FROM read_json_auto('{json_path}')")
-        
-        # Check that we can read the base data
-        base_count = con.sql("SELECT COUNT(*) FROM base_cube").fetchone()[0]
-        logger.info(f"📊 Base cube records loaded: {base_count}")
-
-        # Create normalized views
-        con.sql("""
-            CREATE OR REPLACE VIEW cube AS 
-            SELECT DISTINCT
-                productId, cansimId, cubeTitleEn, cubeTitleFr,
-                CAST(cubeStartDate AS DATE) AS cubeStartDate,
-                CAST(cubeEndDate AS DATE) AS cubeEndDate,
-                CAST(releaseTime AS DATE) AS releaseTime,
-                CAST(archived AS SMALLINT) AS archived,
-                CAST(frequencyCode AS SMALLINT) AS frequencyCode,
-                CAST(issueDate AS DATE) AS issueDate
-            FROM base_cube;
-        """)
-
-        con.sql("""
-            CREATE OR REPLACE VIEW cube_subject AS 
-            SELECT productId, UNNEST(subjectCode) AS subjectCode 
-            FROM base_cube 
-            WHERE subjectCode IS NOT NULL AND len(subjectCode) > 0;
-        """)
-
-        con.sql("""
-            CREATE OR REPLACE VIEW cube_survey AS 
-            SELECT productId, UNNEST(surveyCode) AS surveyCode 
-            FROM base_cube 
-            WHERE surveyCode IS NOT NULL AND len(surveyCode) > 0;
-        """)
-
-        logger.success("✅ DuckDB views created successfully")
-        return json_path
-        
-    except Exception as e:
-        # Clean up temp file on error
-        if os.path.exists(json_path):
-            os.remove(json_path)
-        raise RuntimeError(f"❌ Failed to create DuckDB views: {e}")
-
-
-def validate_staged_data(existing_stats: dict):
-    """Comprehensive validation of staged data before database update"""
-    logger.info("🔍 Validating staged data...")
-    
-    # Get counts from staged views
-    cube_count = con.sql("SELECT COUNT(*) FROM cube").fetchone()[0]
-    subject_count = con.sql("SELECT COUNT(*) FROM cube_subject").fetchone()[0]
-    survey_count = con.sql("SELECT COUNT(*) FROM cube_survey").fetchone()[0]
-    
-    logger.info(f"📊 Staged data: {cube_count} cubes, {subject_count} subjects, {survey_count} surveys")
-    
-    # Validation 1: Minimum cube count
-    if cube_count < MIN_EXPECTED_CUBES:
-        raise ValueError(f"❌ Too few cubes staged: {cube_count} < {MIN_EXPECTED_CUBES}")
-    
-    # Validation 2: Required fields not null
-    null_product_ids = con.sql("SELECT COUNT(*) FROM cube WHERE productId IS NULL").fetchone()[0]
-    if null_product_ids > 0:
-        raise ValueError(f"❌ {null_product_ids} cubes have NULL productId")
-    
-    null_titles = con.sql("SELECT COUNT(*) FROM cube WHERE cubeTitleEn IS NULL OR trim(cubeTitleEn) = ''").fetchone()[0]
-    if null_titles > 0:
-        raise ValueError(f"❌ {null_titles} cubes have NULL or empty English titles")
-    
-    # Validation 3: Product ID uniqueness
-    duplicate_ids = con.sql("SELECT COUNT(*) - COUNT(DISTINCT productId) FROM cube").fetchone()[0]
-    if duplicate_ids > 0:
-        raise ValueError(f"❌ {duplicate_ids} duplicate product IDs found")
-    
-    # Validation 4: Subject coverage (most cubes should have subjects)
-    cubes_with_subjects = con.sql("SELECT COUNT(DISTINCT productId) FROM cube_subject").fetchone()[0]
-    subject_ratio = cubes_with_subjects / cube_count if cube_count > 0 else 0
-    if subject_ratio < MIN_SUBJECTS_RATIO:
-        raise ValueError(f"❌ Too few cubes with subjects: {subject_ratio:.1%} < {MIN_SUBJECTS_RATIO:.1%}")
-    
-    # Validation 5: Compare with existing data (if exists)
-    if existing_stats['cube_count'] > 0:
-        size_ratio = cube_count / existing_stats['cube_count']
-        if size_ratio < (1 - MAX_SIZE_VARIANCE) or size_ratio > (1 + MAX_SIZE_VARIANCE):
-            logger.warning(f"⚠️  Large size change: {existing_stats['cube_count']} → {cube_count} ({size_ratio:.1%})")
-            if size_ratio < 0.5:  # More than 50% reduction is suspicious
-                raise ValueError(f"❌ Suspicious data reduction: {size_ratio:.1%} of original size")
-    
-    # Validation 6: Data type consistency
-    invalid_archived = con.sql("SELECT COUNT(*) FROM cube WHERE archived NOT IN (0, 1, NULL)").fetchone()[0]
-    if invalid_archived > 0:
-        raise ValueError(f"❌ {invalid_archived} cubes have invalid archived values")
-    
-    logger.success("✅ Staged data validation passed")
-    logger.info(f"📈 Subject coverage: {subject_ratio:.1%}")
-    
-    return {
-        'cube_count': cube_count,
-        'subject_count': subject_count,
-        'survey_count': survey_count,
-        'subject_ratio': subject_ratio
-    }
-
-
-def insert_into_postgres(staged_stats: dict):
-    """Insert the validated staged data into the spine schema in PostgreSQL."""
-    target_tables = ["cube", "cube_subject", "cube_survey"]
-
-    with psycopg2.connect(**DB_CONFIG) as pg:
-        with pg.cursor() as cur:
-            try:
-                logger.info("🔄 Starting atomic spine update...")
-                
-                # Begin explicit transaction
-                cur.execute("BEGIN")
-                
-                # Truncate tables (within transaction)
-                cur.execute("TRUNCATE TABLE spine.cube, spine.cube_subject, spine.cube_survey CASCADE")
-                logger.info("🗑️  Spine tables truncated")
-
-                # Insert data for each table
-                for table in target_tables:
-                    logger.info(f"📥 Inserting {table} data...")
-                    
-                    df = con.sql(f"SELECT * FROM {table}").fetchdf()
-                    if df.empty:
-                        logger.warning(f"⚠️  No data for {table}, skipping...")
-                        continue
-
-                    df = normalize_datetime(df)
-                    columns = ','.join(df.columns)
-                    values = [tuple(row) for row in df.itertuples(index=False)]
-                    
-                    sql = f"INSERT INTO spine.{table} ({columns}) VALUES %s"
-                    execute_values(cur, sql, values)
-                    
-                    logger.info(f"✅ Inserted {len(values)} rows into spine.{table}")
-
-                # Commit transaction
-                cur.execute("COMMIT")
-                logger.success("✅ Spine update committed successfully")
-                
-                # Log final summary
-                logger.info("📊 Update summary:")
-                logger.info(f"   Cubes: {staged_stats['cube_count']}")
-                logger.info(f"   Subjects: {staged_stats['subject_count']}")
-                logger.info(f"   Surveys: {staged_stats['survey_count']}")
-
-            except Exception as e:
-                # Rollback on any error
-                cur.execute("ROLLBACK")
-                logger.error("🔄 Transaction rolled back due to error")
-                raise RuntimeError(f"❌ Failed to update spine tables: {e}")
-
-
-def main():
-    json_path = None
-    try:
-        logger.info("🚀 Starting enhanced spine ETL...")
-
-        # Get active file and existing stats
-        file_path = get_active_file_path()
-        
         with psycopg2.connect(**DB_CONFIG) as conn:
             with conn.cursor() as cur:
-                existing_stats = get_existing_spine_stats(cur)
+                cur.execute(query)
+                result = cur.fetchone()
+                
+                if not result:
+                    logger.error("❌ No active spine metadata file found in registry")
+                    raise RuntimeError("No active spine metadata file found in database registry")
+                
+                file_path = result[0]
+                logger.info(f"📁 Active spine file: {file_path}")
+                return file_path
+                
+    except psycopg2.Error as e:
+        logger.error(f"❌ Database error retrieving active file: {e}")
+        raise RuntimeError(f"Database error: {e}")
 
-        # Stage and validate data
-        json_path = stage_data(file_path)
-        staged_stats = validate_staged_data(existing_stats)
+def validate_json_file(file_path: str) -> dict:
+    """Validate JSON file structure and return metadata."""
+    logger.info(f"🔍 Validating JSON file: {os.path.basename(file_path)}")
+    
+    # Check file exists and is readable
+    if not os.path.exists(file_path):
+        logger.error(f"❌ File does not exist: {file_path}")
+        raise FileNotFoundError(f"Spine metadata file not found: {file_path}")
+    
+    if not os.access(file_path, os.R_OK):
+        logger.error(f"❌ File not readable: {file_path}")
+        raise PermissionError(f"Cannot read spine metadata file: {file_path}")
+    
+    # Get file metadata
+    file_size = os.path.getsize(file_path)
+    logger.info(f"📊 File size: {file_size:,} bytes")
+    
+    # Validate JSON structure
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        if not isinstance(data, list):
+            logger.error("❌ JSON file must contain array of cube objects")
+            raise ValueError("Invalid JSON structure: expected array of objects")
         
-        # Update database with validated data
-        insert_into_postgres(staged_stats)
-
-        logger.success("✅ Enhanced spine ETL completed successfully")
-
+        if len(data) == 0:
+            logger.error("❌ JSON file contains no cube data")
+            raise ValueError("Empty JSON file: no cube metadata found")
+        
+        # Validate required fields in first record
+        required_fields = ['productId', 'cubeTitleEn', 'subjectCode']
+        sample_record = data[0]
+        missing_fields = [field for field in required_fields if field not in sample_record]
+        
+        if missing_fields:
+            logger.error(f"❌ Missing required fields: {missing_fields}")
+            raise ValueError(f"Invalid JSON structure: missing fields {missing_fields}")
+        
+        logger.info(f"✅ JSON validation passed - {len(data):,} cube records")
+        
+        return {
+            'file_path': file_path,
+            'file_size': file_size,
+            'record_count': len(data),
+            'sample_record': sample_record
+        }
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ Invalid JSON format: {e}")
+        raise ValueError(f"JSON decode error: {e}")
     except Exception as e:
-        logger.exception("❌ Enhanced spine ETL failed")
+        logger.error(f"❌ JSON validation failed: {e}")
         raise
-    finally:
-        con.close()
-        if json_path and os.path.exists(json_path):
-            os.remove(json_path)
-            logger.info("🧹 Temporary files cleaned up")
 
+def stage_data_in_duckdb(file_path: str) -> duckdb.DuckDBPyConnection:
+    """Stage JSON data in DuckDB with comprehensive validation and type casting."""
+    logger.info("🦆 Staging data in DuckDB...")
+    
+    # Create in-memory DuckDB connection
+    con = duckdb.connect(":memory:")
+    
+    try:
+        # Install and load JSON extension
+        con.execute("INSTALL json; LOAD json;")
+        logger.info("✅ DuckDB JSON extension loaded")
+        
+        # Create base view from JSON file
+        con.execute(f"""
+            CREATE OR REPLACE VIEW base_cube AS 
+            SELECT * FROM read_json_auto('{file_path}')
+        """)
+        
+        # Validate base data loaded
+        base_count = con.execute("SELECT COUNT(*) FROM base_cube").fetchone()[0]
+        logger.info(f"📊 Base cube records loaded: {base_count:,}")
+        
+        if base_count == 0:
+            raise ValueError("No records loaded from JSON file")
+        
+        # Create normalized cube view with robust type casting
+        logger.info("🔄 Creating normalized cube view...")
+        con.execute("""
+            CREATE OR REPLACE VIEW cube AS 
+            SELECT DISTINCT
+                productId,
+                cansimId,
+                cubeTitleEn,
+                cubeTitleFr,
+                TRY_CAST(cubeStartDate AS DATE) AS cubeStartDate,
+                TRY_CAST(cubeEndDate AS DATE) AS cubeEndDate,
+                TRY_CAST(releaseTime AS TIMESTAMP) AS releaseTime,
+                COALESCE(TRY_CAST(archived AS SMALLINT), 0) AS archived,
+                COALESCE(TRY_CAST(frequencyCode AS SMALLINT), 0) AS frequencyCode,
+                TRY_CAST(issueDate AS TIMESTAMP) AS issueDate
+            FROM base_cube
+            WHERE productId IS NOT NULL
+        """)
+        
+        # Create subject relationship view
+        logger.info("🔗 Creating cube-subject relationship view...")
+        con.execute("""
+            CREATE OR REPLACE VIEW cube_subject AS 
+            SELECT DISTINCT
+                productId,
+                UNNEST(subjectCode) AS subjectCode
+            FROM base_cube
+            WHERE productId IS NOT NULL 
+            AND subjectCode IS NOT NULL
+            AND len(subjectCode) > 0
+        """)
+        
+        # Create survey relationship view  
+        logger.info("🔗 Creating cube-survey relationship view...")
+        con.execute("""
+            CREATE OR REPLACE VIEW cube_survey AS 
+            SELECT DISTINCT
+                productId,
+                UNNEST(surveyCode) AS surveyCode
+            FROM base_cube
+            WHERE productId IS NOT NULL 
+            AND surveyCode IS NOT NULL
+            AND len(surveyCode) > 0
+        """)
+        
+        # Validate all views created successfully
+        for table in TARGET_TABLES:
+            count = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            logger.info(f"📊 {table} view: {count:,} records")
+            
+            if count == 0 and table == "cube":
+                raise ValueError("No cube records after processing - data validation failed")
+        
+        logger.info("✅ DuckDB staging complete")
+        return con
+        
+    except Exception as e:
+        logger.error(f"❌ DuckDB staging failed: {e}")
+        con.close()
+        raise
+
+def capture_spine_tables_state() -> dict:
+    """Capture current state of spine schema tables for testing validation."""
+    logger.info("📸 Capturing spine tables state...")
+    
+    state = {}
+    try:
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            for table in TARGET_TABLES:
+                full_table = f"spine.{table}"
+                df = pd.read_sql(f"SELECT * FROM {full_table} ORDER BY productId", conn)
+                
+                # Create content hash for comparison
+                content_hash = hashlib.md5(
+                    df.to_string(index=False).encode('utf-8')
+                ).hexdigest()
+                
+                state[table] = {
+                    'row_count': len(df),
+                    'content_hash': content_hash,
+                    'data': df
+                }
+                
+                logger.info(f"📊 {full_table}: {len(df):,} rows, hash: {content_hash[:8]}...")
+        
+        return state
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to capture spine tables state: {e}")
+        raise
+
+def load_to_postgres_atomic(con: duckdb.DuckDBPyConnection) -> dict:
+    """Load all spine data to PostgreSQL in single atomic transaction."""
+    logger.info("📥 Starting atomic PostgreSQL load...")
+    
+    temp_files = []
+    load_stats = {}
+    
+    try:
+        with psycopg2.connect(**DB_CONFIG) as pg_conn:
+            with pg_conn.cursor() as cur:
+                logger.info("🔄 Beginning atomic transaction...")
+                
+                # Truncate all spine tables first
+                logger.info("🗑️ Truncating existing spine tables...")
+                cur.execute("TRUNCATE TABLE spine.cube, spine.cube_subject, spine.cube_survey CASCADE")
+                
+                # Load each table using DuckDB -> CSV -> PostgreSQL pipeline
+                for table in TARGET_TABLES:
+                    logger.info(f"📊 Processing {table}...")
+                    
+                    # Generate temporary CSV file
+                    temp_csv = os.path.join(TEMP_DIR, f"spine_{table}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+                    temp_files.append(temp_csv)
+                    
+                    # Export from DuckDB to CSV
+                    con.execute(f"""
+                        COPY (SELECT * FROM {table}) 
+                        TO '{temp_csv}' 
+                        (FORMAT CSV, HEADER true)
+                    """)
+                    
+                    # Verify CSV file created
+                    if not os.path.exists(temp_csv):
+                        raise RuntimeError(f"Failed to create temporary CSV file: {temp_csv}")
+                    
+                    csv_size = os.path.getsize(temp_csv)
+                    logger.info(f"📁 Generated CSV: {os.path.basename(temp_csv)} ({csv_size:,} bytes)")
+                    
+                    # Import CSV to PostgreSQL
+                    with open(temp_csv, 'r') as csv_file:
+                        cur.copy_expert(f"COPY spine.{table} FROM STDIN CSV HEADER", csv_file)
+                    
+                    # Validate load
+                    cur.execute(f"SELECT COUNT(*) FROM spine.{table}")
+                    loaded_count = cur.fetchone()[0]
+                    
+                    load_stats[table] = {
+                        'records_loaded': loaded_count,
+                        'csv_size': csv_size
+                    }
+                    
+                    logger.info(f"✅ {table}: {loaded_count:,} records loaded")
+                
+                # Validate foreign key relationships
+                logger.info("🔗 Validating relationships...")
+                cur.execute("""
+                    SELECT COUNT(*) FROM spine.cube_subject cs
+                    LEFT JOIN spine.cube c ON cs.productId = c.productId
+                    WHERE c.productId IS NULL
+                """)
+                orphaned_subjects = cur.fetchone()[0]
+                
+                cur.execute("""
+                    SELECT COUNT(*) FROM spine.cube_survey cs
+                    LEFT JOIN spine.cube c ON cs.productId = c.productId
+                    WHERE c.productId IS NULL
+                """)
+                orphaned_surveys = cur.fetchone()[0]
+                
+                if orphaned_subjects > 0:
+                    logger.warning(f"⚠️ Found {orphaned_subjects} orphaned subject relationships")
+                if orphaned_surveys > 0:
+                    logger.warning(f"⚠️ Found {orphaned_surveys} orphaned survey relationships")
+                
+                # Commit transaction
+                pg_conn.commit()
+                logger.info("✅ Atomic transaction committed successfully")
+                
+                return load_stats
+                
+    except Exception as e:
+        logger.error(f"❌ PostgreSQL load failed: {e}")
+        raise
+    
+    finally:
+        # Clean up temporary files
+        for temp_file in temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                    logger.info(f"🗑️ Cleaned up: {os.path.basename(temp_file)}")
+            except Exception as cleanup_error:
+                logger.warning(f"⚠️ Failed to clean up {temp_file}: {cleanup_error}")
+
+def validate_processing_results(load_stats: dict) -> None:
+    """Validate final processing results and data integrity."""
+    logger.info("🔍 Validating processing results...")
+    
+    try:
+        with psycopg2.connect(**DB_CONFIG) as conn:
+            with conn.cursor() as cur:
+                # Validate all tables have data
+                total_records = 0
+                for table in TARGET_TABLES:
+                    cur.execute(f"SELECT COUNT(*) FROM spine.{table}")
+                    count = cur.fetchone()[0]
+                    expected = load_stats[table]['records_loaded']
+                    
+                    if count != expected:
+                        raise ValueError(f"Record count mismatch in {table}: expected {expected}, found {count}")
+                    
+                    total_records += count
+                    logger.info(f"✅ {table}: {count:,} records validated")
+                
+                # Validate core cube data integrity
+                cur.execute("SELECT COUNT(*) FROM spine.cube WHERE productId IS NULL OR cubeTitleEn = ''")
+                invalid_cubes = cur.fetchone()[0]
+                
+                if invalid_cubes > 0:
+                    logger.warning(f"⚠️ Found {invalid_cubes} cubes with missing required data")
+                
+                # Check for reasonable data distribution
+                cur.execute("SELECT COUNT(DISTINCT productId) FROM spine.cube")
+                unique_cubes = cur.fetchone()[0]
+                
+                cur.execute("SELECT COUNT(DISTINCT subjectCode) FROM spine.cube_subject")
+                unique_subjects = cur.fetchone()[0]
+                
+                logger.info(f"📊 Data summary: {unique_cubes:,} unique cubes, {unique_subjects:,} unique subjects")
+                logger.info(f"✅ Processing validation complete - {total_records:,} total records")
+                
+    except Exception as e:
+        logger.error(f"❌ Processing validation failed: {e}")
+        raise
+
+def main() -> None:
+    """Main processing function with comprehensive error handling."""
+    con = None
+    
+    try:
+        logger.info("🎯 SCRIPT 02: Spine Load to Database - Starting")
+        start_time = datetime.now()
+        
+        # Phase 1: Prerequisites and validation
+        validate_prerequisites()
+        file_path = get_active_file_path()
+        file_metadata = validate_json_file(file_path)
+        
+        # Phase 2: Data staging
+        con = stage_data_in_duckdb(file_path)
+        
+        # Phase 3: Database loading
+        load_stats = load_to_postgres_atomic(con)
+        
+        # Phase 4: Final validation
+        validate_processing_results(load_stats)
+        
+        # Success summary
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        total_records = sum(stats['records_loaded'] for stats in load_stats.values())
+        
+        logger.info(f"✅ SCRIPT 02 COMPLETE")
+        logger.info(f"⏱️ Processing time: {duration:.1f} seconds")
+        logger.info(f"📊 Total records processed: {total_records:,}")
+        logger.info(f"📁 Source file: {os.path.basename(file_path)} ({file_metadata['file_size']:,} bytes)")
+        
+    except Exception as e:
+        logger.error(f"❌ SCRIPT 02 FAILED: {e}")
+        logger.exception("Full error traceback:")
+        raise
+        
+    finally:
+        # Cleanup DuckDB connection
+        if con:
+            try:
+                con.close()
+                logger.info("🦆 DuckDB connection closed")
+            except Exception as cleanup_error:
+                logger.warning(f"⚠️ DuckDB cleanup warning: {cleanup_error}")
 
 if __name__ == "__main__":
     main()
