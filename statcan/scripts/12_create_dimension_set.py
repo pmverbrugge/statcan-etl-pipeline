@@ -1,232 +1,270 @@
 #!/usr/bin/env python3
 """
-Statistics Canada Canonical Dimension Registry Builder
-=====================================================
+Statcan Public Data ETL Pipeline
+Script: 12_create_dimension_set.py
+Date: 2025-06-21
+Author: Paul Verbrugge with Claude Sonnet 4 (Anthropic)
 
-Script:     12_build_canonical_registry.py
-Purpose:    Build canonical dimension registry from processed dimensions
-Author:     Paul Verbrugge with Claude Sonnet 4 (Anthropic)
-Created:    2025
-Updated:    June 2025
+Build canonical dimension registry from processed dimensions with deduplication and normalization.
 
-Overview:
---------
-This script creates the canonical dimension registry by summarizing processed
-dimensions by dimension_hash and selecting the most common labels with proper
-formatting for presentation.
-
-Key Changes:
-- All references now point to processing schema (no dictionary schema dependencies)
-- Enhanced error handling and validation
-- TimescaleDB optimization support
-- Improved slugification using python-slugify
-
-Requires: 11_process_dimensions.py to have run successfully first.
+This script creates the canonical dimension registry by aggregating processed dimensions
+by dimension_hash and selecting the most common labels with proper formatting. The result
+is a deduplicated set of dimension definitions that can be reused across multiple cubes.
 
 Key Operations:
---------------
-• Aggregate processed_dimensions by dimension_hash
-• Select most common English/French dimension names
-• Apply title case formatting to canonical names
-• Create slugified versions of names
-• Build processing.dimension_set (canonical definitions)
+- Aggregate processed dimensions by dimension_hash for deduplication
+- Select most common English/French dimension names using SQL aggregation
+- Apply title case formatting and create URL-friendly slugs
+- Calculate usage statistics and UOM flag consolidation
+- Store canonical definitions in processing.dimension_set
 
-Processing Pipeline:
--------------------
-1. Load processed dimensions from script 11
-2. Group by dimension_hash and select most common labels
-3. Apply title case and create slugs
-4. Store canonical definitions in processing.dimension_set
-5. Generate summary statistics
+Processing Logic:
+1. Load processed dimensions from processing.processed_dimensions
+2. Group by dimension_hash and aggregate labels using PostgreSQL functions
+3. Apply text normalization (title case) and generate slugs
+4. Calculate usage counts and consolidate UOM flags
+5. Store canonical dimension definitions with comprehensive validation
+6. Generate deduplication statistics and quality metrics
 
-Note: Cube-to-dimension mapping remains in processing.processed_dimensions
-for now. Final registry mapping will be handled in later scripts.
+Dependencies:
+- Requires processing.processed_dimensions from 11_process_dimension.py
+- Outputs to processing.dimension_set for canonical dimension registry
+- Feeds into 13_create_dimension_set_members.py for member processing
 """
 
-import pandas as pd
 import psycopg2
-from slugify import slugify
 from loguru import logger
 from statcan.tools.config import DB_CONFIG
 
-logger.add("/app/logs/build_canonical_registry.log", rotation="1 MB", retention="7 days")
+# Configure logging with minimal approach
+logger.add("/app/logs/create_dimension_set.log", rotation="5 MB", retention="7 days")
 
-def get_db_conn():
-    return psycopg2.connect(**DB_CONFIG)
-
-def title_case(text):
-    """Apply title case to text"""
-    if pd.isna(text) or text is None:
+def title_case_sql(text):
+    """Convert text to title case handling None values"""
+    if text is None:
         return None
     return str(text).title()
 
 def create_slug(text):
     """Create URL-friendly slug from text"""
-    if pd.isna(text) or text is None:
+    if text is None:
         return None
-    return slugify(text, separator="_").lower()
+    
+    # Simple slugification - replace spaces and special chars with underscores
+    slug = str(text).lower()
+    # Replace common special characters
+    replacements = {
+        ' ': '_', '-': '_', '(': '', ')': '', '[': '', ']': '',
+        '&': 'and', '/': '_', ',': '', '.': '', ':': '', ';': '',
+        "'": '', '"': '', '?': '', '!': '', '@': '', '#': '', '$': '',
+        '%': '', '^': '', '*': '', '+': '', '=': '', '|': '', '\\': '',
+        '<': '', '>': '', '~': '', '`': ''
+    }
+    
+    for char, replacement in replacements.items():
+        slug = slug.replace(char, replacement)
+    
+    # Clean up multiple underscores
+    while '__' in slug:
+        slug = slug.replace('__', '_')
+    
+    # Remove leading/trailing underscores
+    slug = slug.strip('_')
+    
+    return slug if slug else None
 
-def check_required_tables():
-    """Verify required tables exist"""
-    with get_db_conn() as conn:
-        cur = conn.cursor()
-        
-        required_tables = [
-            ('processing', 'processed_dimensions'),
-            ('processing', 'dimension_set')
-        ]
-        
-        for schema, table_name in required_tables:
+def validate_prerequisites():
+    """Validate that prerequisite tables exist and have data"""
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            # Check processed_dimensions table
             cur.execute("""
                 SELECT EXISTS (
                     SELECT FROM information_schema.tables 
-                    WHERE table_schema = %s AND table_name = %s
+                    WHERE table_schema = 'processing' AND table_name = 'processed_dimensions'
                 )
-            """, (schema, table_name))
-            
+            """)
             if not cur.fetchone()[0]:
-                raise Exception(
-                    f"❌ Required table {schema}.{table_name} does not exist! "
-                    "Please run the DDL script to create it first."
+                raise Exception("❌ Source table processing.processed_dimensions does not exist")
+            
+            cur.execute("SELECT COUNT(*) FROM processing.processed_dimensions")
+            dimension_count = cur.fetchone()[0]
+            if dimension_count == 0:
+                raise Exception("❌ No processed dimensions found - run script 11 first")
+            
+            # Check target table
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_schema = 'processing' AND table_name = 'dimension_set'
                 )
-        
-        logger.info("✅ All required tables exist")
+            """)
+            if not cur.fetchone()[0]:
+                raise Exception("❌ Target table processing.dimension_set does not exist")
+            
+            return dimension_count
 
 def build_canonical_dimensions():
-    """Build canonical dimension definitions from processed dimensions"""
-    logger.info("🚀 Starting canonical dimension registry build...")
-    
-    check_required_tables()
-    
-    with get_db_conn() as conn:
-        # Load processed dimensions
-        logger.info("📥 Loading processed dimension data...")
-        processed_dims = pd.read_sql("""
-            SELECT dimension_hash, dimension_name_en, dimension_name_fr, has_uom,
-                   productid, dimension_position
-            FROM processing.processed_dimensions
-        """, conn)
-        
-        logger.info(f"📊 Processing {len(processed_dims)} dimension instances")
-        
-        # Group by dimension_hash and select most common labels
-        logger.info("🔨 Building canonical dimension definitions...")
-        
-        def select_canonical_labels(group):
-            """Select most common labels for a dimension_hash"""
-            # Count frequency of each English label
-            en_counts = group['dimension_name_en'].value_counts()
-            most_common_en = en_counts.index[0] if len(en_counts) > 0 else None
+    """Build canonical dimension definitions using PostgreSQL aggregation"""
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            # Clear existing canonical dimensions
+            cur.execute("TRUNCATE TABLE processing.dimension_set")
             
-            # Count frequency of each French label  
-            fr_counts = group['dimension_name_fr'].value_counts()
-            most_common_fr = fr_counts.index[0] if len(fr_counts) > 0 else None
-            
-            # Take maximum value of has_uom (TRUE wins over FALSE)
-            max_has_uom = group['has_uom'].max() if group['has_uom'].notna().any() else False
-            
-            # Count usage
-            usage_count = len(group)
-            
-            return pd.Series({
-                'dimension_name_en': most_common_en,
-                'dimension_name_fr': most_common_fr,
-                'has_uom': max_has_uom,
-                'usage_count': usage_count
-            })
-        
-        # Create canonical dimension set
-        canonical_dims = (
-            processed_dims.groupby('dimension_hash')
-            .apply(select_canonical_labels, include_groups=False)
-            .reset_index()
-        )
-        
-        # Apply title case and create slugs
-        logger.info("🎨 Applying title case and creating slugs...")
-        canonical_dims['dimension_name_en'] = canonical_dims['dimension_name_en'].apply(title_case)
-        canonical_dims['dimension_name_fr'] = canonical_dims['dimension_name_fr'].apply(title_case)
-        
-        canonical_dims['dimension_name_en_slug'] = canonical_dims['dimension_name_en'].apply(create_slug)
-        canonical_dims['dimension_name_fr_slug'] = canonical_dims['dimension_name_fr'].apply(create_slug)
-        
-        logger.info(f"📈 Created {len(canonical_dims)} canonical dimension definitions")
-        
-        # Store canonical dimensions
-        logger.info("💾 Storing canonical dimension definitions...")
-        cur = conn.cursor()
-        
-        # Clear existing data
-        cur.execute("TRUNCATE TABLE processing.dimension_set")
-        
-        # Insert canonical definitions
-        for _, row in canonical_dims.iterrows():
+            # Build canonical dimensions using SQL aggregation
+            # This approach is more efficient than pandas for large datasets
             cur.execute("""
                 INSERT INTO processing.dimension_set (
-                    dimension_hash, dimension_name_en, dimension_name_fr,
-                    dimension_name_en_slug, dimension_name_fr_slug,
-                    has_uom, usage_count
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (
-                row['dimension_hash'],
-                row['dimension_name_en'],
-                row['dimension_name_fr'], 
-                row['dimension_name_en_slug'],
-                row['dimension_name_fr_slug'],
-                row['has_uom'],
-                int(row['usage_count'])
-            ))
-        
-        conn.commit()
-        logger.success(f"✅ Stored {len(canonical_dims)} canonical dimension definitions")
+                    dimension_hash, 
+                    dimension_name_en, 
+                    dimension_name_fr,
+                    dimension_name_en_slug,
+                    dimension_name_fr_slug,
+                    has_uom, 
+                    usage_count
+                )
+                SELECT 
+                    dimension_hash,
+                    -- Select most common English name (mode)
+                    (SELECT dimension_name_en 
+                     FROM processing.processed_dimensions pd2 
+                     WHERE pd2.dimension_hash = pd1.dimension_hash 
+                       AND dimension_name_en IS NOT NULL
+                     GROUP BY dimension_name_en 
+                     ORDER BY COUNT(*) DESC, dimension_name_en 
+                     LIMIT 1) as dimension_name_en,
+                    -- Select most common French name (mode)
+                    (SELECT dimension_name_fr 
+                     FROM processing.processed_dimensions pd2 
+                     WHERE pd2.dimension_hash = pd1.dimension_hash 
+                       AND dimension_name_fr IS NOT NULL
+                     GROUP BY dimension_name_fr 
+                     ORDER BY COUNT(*) DESC, dimension_name_fr 
+                     LIMIT 1) as dimension_name_fr,
+                    -- Slugs will be updated in next step
+                    NULL as dimension_name_en_slug,
+                    NULL as dimension_name_fr_slug,
+                    -- Take maximum UOM flag (TRUE wins over FALSE)
+                    COALESCE(BOOL_OR(has_uom), FALSE) as has_uom,
+                    -- Count total usage
+                    COUNT(*) as usage_count
+                FROM processing.processed_dimensions pd1
+                GROUP BY dimension_hash
+            """)
+            
+            canonical_count = cur.rowcount
+            
+            # Update with title case and slugs using Python processing
+            # Get all canonical dimensions for slug generation
+            cur.execute("""
+                SELECT dimension_hash, dimension_name_en, dimension_name_fr
+                FROM processing.dimension_set
+            """)
+            
+            dimensions_to_update = cur.fetchall()
+            
+            # Update each dimension with formatted names and slugs
+            for dimension_hash, name_en, name_fr in dimensions_to_update:
+                # Apply title case formatting
+                formatted_en = title_case_sql(name_en) if name_en else None
+                formatted_fr = title_case_sql(name_fr) if name_fr else None
+                
+                # Generate slugs
+                slug_en = create_slug(formatted_en) if formatted_en else None
+                slug_fr = create_slug(formatted_fr) if formatted_fr else None
+                
+                # Update the record
+                cur.execute("""
+                    UPDATE processing.dimension_set 
+                    SET 
+                        dimension_name_en = %s,
+                        dimension_name_fr = %s,
+                        dimension_name_en_slug = %s,
+                        dimension_name_fr_slug = %s
+                    WHERE dimension_hash = %s
+                """, (formatted_en, formatted_fr, slug_en, slug_fr, dimension_hash))
+            
+            conn.commit()
+            return canonical_count
 
-def generate_summary_stats():
-    """Generate and log summary statistics"""
-    logger.info("📊 Generating registry statistics...")
-    
-    with get_db_conn() as conn:
-        # Canonical dimensions
-        result = pd.read_sql("SELECT COUNT(*) as count FROM processing.dimension_set", conn)
-        canonical_count = result.iloc[0]['count']
-        
-        # Total dimension instances
-        result = pd.read_sql("SELECT COUNT(*) as count FROM processing.processed_dimensions", conn)
-        total_instances = result.iloc[0]['count']
-        
-        # Deduplication rate
-        deduplication_rate = ((total_instances - canonical_count) / total_instances * 100) if total_instances > 0 else 0
-        
-        # Most used dimensions
-        top_dims = pd.read_sql("""
-            SELECT dimension_name_en, usage_count 
-            FROM processing.dimension_set 
-            ORDER BY usage_count DESC 
-            LIMIT 5
-        """, conn)
-        
-        logger.success(f"📈 Registry Summary:")
-        logger.success(f"   • {canonical_count:,} canonical dimensions")
-        logger.success(f"   • {total_instances:,} total dimension instances")
-        logger.success(f"   • {deduplication_rate:.1f}% deduplication rate")
-        
-        logger.info("🏆 Top 5 most used dimensions:")
-        for _, dim in top_dims.iterrows():
-            logger.info(f"   • {dim['dimension_name_en']}: {dim['usage_count']:,} uses")
+def validate_results():
+    """Validate canonical dimension creation and generate statistics"""
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            # Basic counts
+            cur.execute("SELECT COUNT(*) FROM processing.dimension_set")
+            canonical_count = cur.fetchone()[0]
+            
+            cur.execute("SELECT COUNT(*) FROM processing.processed_dimensions")
+            total_instances = cur.fetchone()[0]
+            
+            # Data quality checks
+            cur.execute("""
+                SELECT 
+                    COUNT(*) FILTER (WHERE dimension_name_en IS NULL AND dimension_name_fr IS NULL) as no_names,
+                    COUNT(*) FILTER (WHERE dimension_name_en_slug IS NULL AND dimension_name_fr_slug IS NULL) as no_slugs,
+                    COUNT(*) FILTER (WHERE usage_count = 0) as zero_usage,
+                    MAX(usage_count) as max_usage,
+                    AVG(usage_count) as avg_usage
+                FROM processing.dimension_set
+            """)
+            no_names, no_slugs, zero_usage, max_usage, avg_usage = cur.fetchone()
+            
+            # Calculate deduplication rate
+            dedup_rate = ((total_instances - canonical_count) / total_instances * 100) if total_instances > 0 else 0
+            
+            # Get top dimensions for validation
+            cur.execute("""
+                SELECT dimension_name_en, usage_count 
+                FROM processing.dimension_set 
+                WHERE dimension_name_en IS NOT NULL
+                ORDER BY usage_count DESC 
+                LIMIT 5
+            """)
+            top_dimensions = cur.fetchall()
+            
+            return {
+                'canonical_count': canonical_count,
+                'total_instances': total_instances,
+                'dedup_rate': dedup_rate,
+                'no_names': no_names,
+                'no_slugs': no_slugs,
+                'zero_usage': zero_usage,
+                'max_usage': max_usage,
+                'avg_usage': float(avg_usage) if avg_usage else 0,
+                'top_dimensions': top_dimensions
+            }
 
 def main():
-    """Main registry building function"""
+    """Main canonical dimension registry building function"""
+    logger.info("🚀 Starting canonical dimension registry build...")
+    
     try:
+        # Validate prerequisites
+        dimension_count = validate_prerequisites()
+        logger.info(f"📊 Processing {dimension_count:,} dimension instances...")
+        
         # Build canonical dimensions
-        build_canonical_dimensions()
+        canonical_count = build_canonical_dimensions()
         
-        # Generate summary
-        generate_summary_stats()
+        # Validate results
+        results = validate_results()
         
-        logger.success("🎉 Canonical dimension registry build complete!")
-        logger.info("📝 Cube-to-dimension mappings remain in processing.processed_dimensions")
+        # Final summary
+        logger.success(f"✅ Canonical registry complete: {results['canonical_count']:,} canonical dimensions created")
+        
+        # Warn about concerning issues
+        if results['no_names'] > 0:
+            logger.warning(f"⚠️ {results['no_names']} dimensions missing both English and French names")
+        
+        if results['no_slugs'] > 0:
+            logger.warning(f"⚠️ {results['no_slugs']} dimensions missing both slugs")
+        
+        if results['zero_usage'] > 0:
+            logger.warning(f"⚠️ {results['zero_usage']} dimensions with zero usage count")
         
     except Exception as e:
-        logger.exception(f"❌ Registry build failed: {e}")
+        logger.exception(f"❌ Canonical registry build failed: {e}")
         raise
 
 if __name__ == "__main__":
